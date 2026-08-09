@@ -87,8 +87,15 @@ pub struct BootstrapOutcome {
     pub blocks_decoded_finally: usize,
     /// Concatenated data codewords, present only when every block decoded.
     pub data: Option<Vec<u8>>,
-    /// Modules proven damaged. Ground truth, no false positives.
-    pub proven_damaged_modules: Vec<usize>,
+    /// Modules belonging to codewords proven damaged.
+    ///
+    /// Note the indirection: Reed-Solomon proves a *codeword* was wrong, and a QR codeword's eight
+    /// modules are scattered across the symbol by the placement walk. So this set contains every
+    /// module of every damaged codeword — including modules that were themselves untouched, since
+    /// nothing can say which of the eight was the bad one. The set is dense inside the occlusion and
+    /// sparse outside it, which is exactly what a blob fit needs and is why the fit closes and grows
+    /// rather than taking the points literally.
+    pub damaged_codeword_modules: Vec<usize>,
     /// The fitted occlusion, if there was ever enough evidence to fit one.
     pub region: Option<OcclusionMask>,
 }
@@ -164,13 +171,17 @@ pub fn bootstrap(
             initial_decoded = Some(decoded_now);
         }
 
-        if decoded_now == total {
-            break;
-        }
-
+        // Gather evidence BEFORE checking for completion. A symbol where every block decodes still
+        // has a damage map worth keeping — it is exact, free, and drives the reconstruction mask and
+        // the inspect overlay. Breaking out first would discard it precisely in the case where it is
+        // most trustworthy.
         let before = proven_codewords.len();
         for state in states.iter().filter(|s| s.decoded()) {
             proven_codewords.extend(state.damaged.iter().copied());
+        }
+
+        if decoded_now == total {
+            break;
         }
 
         // No evidence at all: nothing decoded, so there is nothing to bootstrap from. This is the
@@ -213,7 +224,7 @@ pub fn bootstrap(
         None
     };
 
-    let proven_damaged_modules: Vec<usize> = proven_codewords
+    let damaged_codeword_modules: Vec<usize> = proven_codewords
         .iter()
         .filter_map(|&cw| provenance.get(cw))
         .flatten()
@@ -226,7 +237,7 @@ pub fn bootstrap(
         blocks_decoded_initially: initial_decoded.unwrap_or(0),
         blocks_decoded_finally: decoded_finally,
         data,
-        proven_damaged_modules,
+        damaged_codeword_modules,
         region,
     }
 }
@@ -311,7 +322,7 @@ mod tests {
         assert!(out.complete());
         assert_eq!(out.rounds, 1, "no refinement needed");
         assert_eq!(out.blocks_rescued(), 0);
-        assert!(out.proven_damaged_modules.is_empty());
+        assert!(out.damaged_codeword_modules.is_empty());
     }
 
     #[test]
@@ -405,7 +416,7 @@ mod tests {
         assert_eq!(out.rounds, 2, "one round to gather evidence, one to find it stale");
         // Even having failed, it still yields the exact damage the survivor proved — useful for
         // the reconstruction mask and the inspect overlay.
-        assert!(!out.proven_damaged_modules.is_empty());
+        assert!(!out.damaged_codeword_modules.is_empty());
     }
 
     #[test]

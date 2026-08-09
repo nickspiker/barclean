@@ -30,6 +30,8 @@
 
 pub mod bootstrap;
 pub mod erasure;
+pub mod qr;
 
 pub use bootstrap::{BootstrapOutcome, BootstrapParams, bootstrap};
 pub use erasure::{BlockLayout, CodewordProvenance, ErasurePlan};
+pub use qr::{CleanError, Cleaned, clean_bitmatrix, clean_luma};

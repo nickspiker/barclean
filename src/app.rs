@@ -87,8 +87,28 @@ fn colour(r: u8, g: u8, b: u8, a: u8) -> u32 {
 pub enum DecodeState {
     #[default]
     NoFrames,
+    /// No symbol located. A framing, focus or resolution problem, not a damage problem.
     Searching,
+    /// Read without needing any help — a stock decoder would have managed this too.
     Decoded(String),
+    /// Recovered from damage that defeats stock decoding. `rescued` of `total` blocks came back
+    /// only because of the bootstrap loop.
+    Recovered {
+        payload: String,
+        rescued: usize,
+        total: usize,
+    },
+    /// Located and read, but too damaged to recover.
+    TooDamaged { decoded: usize, total: usize },
+}
+
+impl DecodeState {
+    pub fn payload(&self) -> Option<&str> {
+        match self {
+            DecodeState::Decoded(p) | DecodeState::Recovered { payload: p, .. } => Some(p),
+            _ => None,
+        }
+    }
 }
 
 pub struct BarcleanApp {
@@ -174,24 +194,42 @@ impl BarcleanApp {
         self.decode();
     }
 
-    /// Attempt a decode on the current frame with the stock path.
+    /// Run the full cleaning path on the current frame.
     ///
-    /// Only the baseline for now — the erasure and bootstrap machinery attaches here once the
-    /// confidence sampler is feeding it, and until then claiming otherwise on screen would be a
-    /// lie about what the app is doing.
+    /// This is barclean's actual pipeline, not a stock decode: detection, provenance-recording
+    /// codeword extraction, then the bootstrap loop. On an undamaged symbol it costs one extra
+    /// Reed-Solomon pass over a plain decode, and on a damaged one it is the difference between a
+    /// payload and nothing.
+    ///
+    /// Note it runs on the *unrotated* sensor buffer. The detector finds symbols at any orientation
+    /// — that is what the perspective transform is for — so rotating first would cost a full copy
+    /// per frame and resample module edges, which are the entire signal.
     fn decode(&mut self) {
         if self.frame.is_empty() {
             self.state = DecodeState::NoFrames;
             return;
         }
-        let result = rxing::helpers::detect_in_luma(
-            self.frame.luma.clone(),
+        self.state = match crate::clean::clean_luma(
+            &self.frame.luma,
             self.frame.width as u32,
             self.frame.height as u32,
-            None,
-        );
-        self.state = match result {
-            Ok(r) => DecodeState::Decoded(r.getText().to_string()),
+        ) {
+            Ok(c) if c.needed_barclean() => {
+                let (rescued, total) = (c.blocks_rescued(), c.blocks_total);
+                DecodeState::Recovered {
+                    payload: c.payload,
+                    rescued,
+                    total,
+                }
+            }
+            Ok(c) => DecodeState::Decoded(c.payload),
+            Err(crate::clean::CleanError::Unrecoverable {
+                blocks_total,
+                blocks_decoded,
+            }) => DecodeState::TooDamaged {
+                decoded: blocks_decoded,
+                total: blocks_total,
+            },
             Err(_) => DecodeState::Searching,
         };
     }
@@ -237,6 +275,10 @@ impl BarcleanApp {
             DecodeState::NoFrames => colour(180, 40, 40, 255),
             DecodeState::Searching => colour(200, 150, 30, 255),
             DecodeState::Decoded(_) => colour(40, 170, 80, 255),
+            // Distinct from a plain decode on purpose: this is the case barclean exists for, and
+            // it should be visible that the symbol needed rescuing rather than merely reading.
+            DecodeState::Recovered { .. } => colour(80, 140, 230, 255),
+            DecodeState::TooDamaged { .. } => colour(190, 90, 30, 255),
         };
         let band = (h / 12).max(8);
         let y0 = h.saturating_sub(band);
@@ -354,6 +396,31 @@ mod tests {
         app.on_camera_frame(&vec![128u8; 64 * 64], 64, 64, 64, 0);
         assert_eq!(app.frames(), 1);
         assert_eq!(*app.state(), DecodeState::Searching);
+    }
+
+    #[test]
+    fn a_rendered_symbol_decodes_through_the_camera_entry_point() {
+        // End-to-end through the same call the JNI shim makes: render a symbol to a luma buffer and
+        // confirm the payload comes back. Guards the wiring between the camera path and the cleaner,
+        // which no amount of algorithm testing would catch.
+        use crate::Symbology;
+        use crate::corpus::symbol;
+
+        let payload = "barclean camera path";
+        let spec = symbol::generate(Symbology::QrCode, payload, "M").unwrap();
+        let img = symbol::render(&spec, 6, 6);
+        let (w, h) = (img.width() as usize, img.height() as usize);
+        let luma: Vec<u8> = img.pixels().map(|p| p.0[0]).collect();
+
+        let mut app = BarcleanApp::new();
+        app.on_camera_frame(&luma, w, h, w, 0);
+
+        assert_eq!(
+            app.state().payload(),
+            Some(payload),
+            "camera entry point did not decode a clean rendered symbol, state was {:?}",
+            app.state()
+        );
     }
 
     #[test]
