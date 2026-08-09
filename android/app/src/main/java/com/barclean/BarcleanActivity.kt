@@ -233,6 +233,7 @@ class BarcleanActivity : Activity(), SurfaceHolder.Callback {
         val ids = (if (physicalIds.isEmpty()) setOf(logicalId) else physicalIds).toList()
         physicalLensIds = ids
 
+        // Named so the magnification lambdas below can take it as a parameter type.
         data class Lens(val id: String, val focal: Float, val sensorW: Float, val minFocusM: Float)
         val lenses = mutableListOf<Lens>()
         for (id in ids) {
@@ -258,16 +259,28 @@ class BarcleanActivity : Activity(), SurfaceHolder.Callback {
             .values
             .map { group -> group.maxByOrNull { it.sensorW }!! }
 
-        // Label by focal length relative to the main camera, which is how phone camera UIs read:
-        // the ultra-wide is the 0.5x, the main is 1x, the telephoto is whatever multiple it is.
-        val widest = deduped.minByOrNull { it.focal }?.focal ?: 1f
-        val main = deduped.filter { it.focal > widest * 1.5f }.minByOrNull { it.focal }?.focal
+        // Label by ANGULAR magnification, not focal length. The three modules have different
+        // physical sensor widths, so focal length alone does not say how much of the scene a lens
+        // takes in: half the field of view is atan(sensorWidth / 2f), which makes the figure of
+        // merit f/sensorWidth. Using bare focal ratios labelled this phone's 0.5x ultra-wide as
+        // "0.3x" and its 5x telephoto as "3x", because their sensors are smaller than the main
+        // camera's and that shrinks their field of view further than focal length suggests.
+        //
+        // Zoom is also not linear in degrees — it scales with the tangent of the half-angle — but
+        // that falls out of the f/w ratio automatically, since tan(hfov/2) IS w/2f.
+        val power = { l: Lens -> l.focal / l.sensorW }
+        val widest = deduped.minByOrNull(power)
+        val main = deduped.filter { power(it) > power(widest!!) * 1.5f }.minByOrNull(power)
             ?: widest
-        for (l in deduped.sortedBy { it.focal }) {
-            val ratio = l.focal / main
+        val mainPower = power(main!!)
+        for (l in deduped.sortedBy(power)) {
+            val ratio = power(l) / mainPower
             val label = when {
-                ratio < 0.75f -> String.format("%.1fx", ratio)
+                ratio < 0.95f -> String.format("%.1fx", ratio)
                 ratio < 1.25f -> "1x"
+                ratio < 9.5f -> String.format("%.1fx", ratio).removeSuffix(".0x").let {
+                    if (it.endsWith("x")) it else it + "x"
+                }
                 else -> String.format("%.0fx", ratio)
             }
             nativeAddLens(nativePtr, l.id, label, l.focal, l.sensorW, 1280, l.minFocusM)
