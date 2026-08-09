@@ -1,0 +1,102 @@
+[package]
+name = "barclean"
+version = "0.0.0"
+edition = "2024"
+authors = ["Nick Spiker <fractaldecoder@proton.me>"]
+license = "MIT OR Apache-2.0"
+description = "Occlusion-aware 2D barcode cleaner. Recovers logo-defaced QR, Aztec, PDF417 and DataMatrix symbols by decoding the occlusion as Reed-Solomon erasures, then re-rendering the original symbol from the corrected codewords."
+
+# rlib for the bins + tests, cdylib for the Android JNI surface. Android loads
+# libbarclean.so and calls the Java_* shims in src/jni/; every other target
+# ignores the cdylib entirely.
+[lib]
+name = "barclean"
+crate-type = ["rlib", "cdylib"]
+
+[features]
+# `gui` pulls fluor. The core (sample / clean / render) never touches it, so
+# `--no-default-features` gives a fast algorithm-only test cycle with no
+# windowing toolchain in the graph. Default is on for `cargo run` convenience.
+default = ["gui"]
+gui = ["dep:fluor"]
+
+[dependencies]
+# The forked ZXing port. Upstream binarizes before detection and samples one
+# centre pixel per module, which destroys the confidence signal barclean runs
+# on; the fork carries the luminance/chroma source into the sampler and adds
+# erasure-aware Reed-Solomon. See /Users/nick/Code/rxing, branch `barclean`.
+#
+# Feature set is scoped to exactly the four 2D symbologies barclean cleans.
+# rxing gates each format separately, so `maxicode` and `oned` stay out of the
+# build entirely rather than riding along as dead code in the APK. `encoding_rs`
+# is not optional in practice — `CharacterSet::encode` does not exist without an
+# encoding backend, and the byte-mode paths need it.
+rxing = { path = "../rxing", default-features = false, features = [
+    "image",
+    "encoders",
+    "decoders",
+    "encoding_rs",
+    "qrcode",
+    "aztec",
+    "datamatrix",
+    "pdf417",
+] }
+# Corpus generation, desktop file loading, and the logo compositing /
+# degradation passes. Pinned to match rxing's own `=0.25.8` exactly — Cargo
+# cannot unify an exact pin with a caret range, and two copies of `image` in the
+# graph would mean two incompatible `ImageBuffer` types across the fork boundary.
+image = "=0.25.8"
+# Chase-II flips 2^k candidate patterns independently — the outer loop is pure
+# fan-out. Also parallelises the per-module cell statistics.
+rayon = "1.10"
+anyhow = "1"
+thiserror = "2"
+
+# Desktop host: fluor over winit + softbuffer (wgpu/Metal on macOS for the
+# transparent squircle corners). Not in the Android graph — winit has no Android
+# backend, which is exactly why fluor splits the host feature per target.
+[target.'cfg(not(target_os = "android"))'.dependencies]
+fluor = { path = "../fluor", default-features = false, features = ["host-winit"], optional = true }
+
+# Android host: fluor's ANativeWindow + Choreographer + JNI backend. Same
+# `BarcleanApp` FluorApp impl as desktop, different shell.
+[target.'cfg(target_os = "android")'.dependencies]
+fluor = { path = "../fluor", default-features = false, features = ["host-android"], optional = true }
+jni = "0.21"
+ndk = { version = "0.9.0", features = ["api-level-26"] }
+ndk-sys = "0.6.0"
+log = "0.4"
+# Routes `log` into logcat, so `adb logcat -s barclean` is the debugging surface on device.
+android_logger = "0.14"
+
+[[bin]]
+name = "barclean"
+path = "src/main.rs"
+required-features = ["gui"]
+
+# Corpus generator: encode clean symbols, composite logos over them, degrade.
+# No GUI dependency — runs headless in CI.
+[[bin]]
+name = "corpus"
+path = "src/bin/corpus.rs"
+
+# The grading harness. Sweeps the corpus and reports recovery rate for plain vs
+# erasure vs Chase-II decoding. This is the number that says whether the whole
+# premise holds.
+[[bin]]
+name = "grade"
+path = "src/bin/grade.rs"
+
+[profile.release]
+opt-level = 3
+debug = 1
+# Wrapping arithmetic in every profile so debug behaves exactly like release.
+# Where saturation is actually wanted, it is spelled out with .saturating_*().
+overflow-checks = false
+
+[profile.dev]
+overflow-checks = false
+# The corpus generator and grading harness are unusably slow without optimised
+# dependencies (image decode, RS arithmetic, the degradation passes).
+[profile.dev.package."*"]
+opt-level = 2

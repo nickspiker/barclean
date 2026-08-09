@@ -1,0 +1,71 @@
+apply plugin: 'com.android.application'
+apply plugin: 'org.jetbrains.kotlin.android'
+
+// barclean is the Rust; the version truth lives in Cargo.toml so Android's numbers cannot drift
+// from it. versionCode = major*10000 + minor*100 + patch, monotonic across every semver bump.
+def cargoVersion = { ->
+    def text = new File(project.rootDir, '../Cargo.toml').text
+    def m = text =~ /(?m)^version\s*=\s*"(\d+)\.(\d+)\.(\d+)"/
+    if (!m.find()) throw new GradleException('No version = "x.y.z" in Cargo.toml')
+    [m.group(1) as int, m.group(2) as int, m.group(3) as int]
+}()
+
+android {
+    namespace 'com.barclean'
+    compileSdk 34
+
+    defaultConfig {
+        applicationId "com.barclean"
+        minSdk 26
+        targetSdk 34
+        // coerceAtLeast(1) because Android rejects a versionCode of 0 and the pre-beta placeholder
+        // version is exactly 0.0.0. That makes 0.0.0 and 0.0.1 share code 1, which is harmless:
+        // 0.0.0 is the "not beta tested yet" marker and by definition never ships anywhere that
+        // orders builds by version code. Every real version keeps the readable mapping, where the
+        // tail digits spell the version back (0.2.2 -> 202).
+        versionCode Math.max(cargoVersion[0] * 10000 + cargoVersion[1] * 100 + cargoVersion[2], 1)
+        versionName "${cargoVersion[0]}.${cargoVersion[1]}.${cargoVersion[2]}"
+        ndk { abiFilters 'arm64-v8a' }
+    }
+
+    buildTypes {
+        release { minifyEnabled false }
+        debug { minifyEnabled false }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+    kotlinOptions { jvmTarget = '17' }
+
+    // build-android.sh writes cargo-ndk output here, not the default src/main/jniLibs.
+    sourceSets { main { jniLibs.srcDirs = ['libs'] } }
+
+    // 16 KB PAGE DEVICES (Pixel 8 Pro and every Android 15+ device).
+    //
+    // Two separate alignments have to be right, and only one of them is the linker's job:
+    //
+    //   1. The .so's own LOAD segments — handled by `-Wl,-z,max-page-size=16384` in
+    //      build-android.sh. Verify with `llvm-readelf -l`; the LOAD rows must read 0x4000.
+    //   2. The .so's byte offset *inside the APK* — because `extractNativeLibs=false` (AGP's
+    //      default) makes the loader mmap the library directly out of base.apk rather than
+    //      extracting it. A 4 KB-aligned offset then places every segment on the wrong page
+    //      boundary on a 16 KB device, and the first write into a mapped buffer takes SIGSEGV
+    //      with SEGV_ACCERR — deep inside whatever code happened to touch it first, which makes
+    //      it look like a bug anywhere but here.
+    //
+    // AGP 8.1 aligns zip entries to 4 KB and has no option to do otherwise; 16 KB entry alignment
+    // arrived in AGP 8.5.1. useLegacyPackaging sets extractNativeLibs=true, so the library is
+    // unpacked to /data at install time and loaded as a normal file, where (1) alone governs and
+    // the APK offset stops mattering. Costs some install size and a little install time.
+    //
+    // On an AGP 8.5.1+ upgrade this can be dropped in favour of the aligned-in-APK path, which is
+    // strictly better at runtime (no extracted copy, demand-paged straight from the APK).
+    packaging { jniLibs { useLegacyPackaging = true } }
+}
+
+dependencies {
+    implementation "org.jetbrains.kotlin:kotlin-stdlib:$kotlin_version"
+    implementation 'androidx.core:core-ktx:1.12.0'
+}
