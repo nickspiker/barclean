@@ -35,5 +35,6 @@
 //! is an extraordinary claim — that we know what the covered modules *were* —
 //! and the overlay is the evidence for it.
 
-// Phase 4. Depends on the fork exposing corrected codewords plus the original
-// version / ECC level / mask, and on `matrix_util::build_from_codewords`.
+pub mod exact;
+
+pub use exact::{Reconstructed, from_codewords};

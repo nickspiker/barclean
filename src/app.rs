@@ -10,8 +10,11 @@ use fluor::event::CursorIcon as FCursorIcon;
 use fluor::event::Event as FEvent;
 use fluor::host::app::{Context, FluorApp};
 use fluor::host::event_response::EventResponse;
-use fluor::paint::pack_argb;
+use fluor::pixel::{Blend, BlendMode};
 use fluor::Viewport;
+
+use crate::camera::{LensPicker, LensSpec, PickerParams};
+use crate::ui::{self, LensButtons, colour};
 
 /// The most recent camera frame's luminance plane.
 #[derive(Clone, Default)]
@@ -60,28 +63,6 @@ impl Frame {
     }
 }
 
-/// Pack a colour for the current host's framebuffer byte order.
-///
-/// fluor's `pack_argb` always lays out ARGB — red in bits 16-23 — and its finalize pass emits that
-/// order unconditionally, with no platform branch. That matches desktop softbuffer. Android's
-/// surface is `RGBA_8888`, which as a little-endian `u32` puts **red in the low byte**, so red and
-/// blue arrive swapped.
-///
-/// The bug hides in exactly the place you would test first: greyscale has `r == g == b`, so a
-/// preview looks perfect while every authored colour comes out as its channel-swapped twin (amber
-/// renders cyan). Anything with an opinion about colour has to go through here.
-#[inline]
-fn colour(r: u8, g: u8, b: u8, a: u8) -> u32 {
-    #[cfg(target_os = "android")]
-    {
-        pack_argb(b, g, r, a)
-    }
-    #[cfg(not(target_os = "android"))]
-    {
-        pack_argb(r, g, b, a)
-    }
-}
-
 /// What the last decode attempt concluded.
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub enum DecodeState {
@@ -100,12 +81,21 @@ pub enum DecodeState {
     },
     /// Located and read, but too damaged to recover.
     TooDamaged { decoded: usize, total: usize },
+    /// Read by the stock decoder in a format barclean does not clean yet.
+    ///
+    /// Aztec, PDF417 and DataMatrix currently fall here: they share the erasure-aware Reed-Solomon
+    /// layer but not the QR-specific bootstrap path. Reporting them honestly beats showing nothing,
+    /// and it separates "detection works, cleaning is not wired" from "nothing works at all" —
+    /// which is otherwise indistinguishable from behind the viewfinder.
+    Uncleaned { payload: String, format: String },
 }
 
 impl DecodeState {
     pub fn payload(&self) -> Option<&str> {
         match self {
-            DecodeState::Decoded(p) | DecodeState::Recovered { payload: p, .. } => Some(p),
+            DecodeState::Decoded(p)
+            | DecodeState::Recovered { payload: p, .. }
+            | DecodeState::Uncleaned { payload: p, .. } => Some(p),
             _ => None,
         }
     }
@@ -124,6 +114,21 @@ pub struct BarcleanApp {
     /// frame per touch and looks frozen otherwise. A camera app is the case where new content
     /// arrives with no user input at all, so it has to raise its own hand.
     pending_frame: bool,
+    /// Wall time of the last decode attempt. A full clean at preview resolution is not free, and if
+    /// it exceeds the frame interval the pipeline is running behind rather than failing.
+    last_decode_ms: u32,
+    /// Symbol width in modules and its measured pixels-per-module, from the last detection.
+    last_symbol: Option<(usize, f32)>,
+    picker: LensPicker,
+    /// Physical camera currently streaming, as reported by the shim.
+    current_lens: String,
+    /// Set when the user taps a lens; the shim polls it and reconfigures the capture session.
+    ///
+    /// A poll rather than a callback because the reconfigure has to happen on the camera thread,
+    /// and reaching back across JNI from inside a render pass to get there would be a deadlock
+    /// waiting to happen.
+    lens_request: Option<String>,
+    buttons: LensButtons,
     viewport: Viewport,
 }
 
@@ -140,6 +145,12 @@ impl BarcleanApp {
             state: DecodeState::NoFrames,
             frames: 0,
             pending_frame: false,
+            last_decode_ms: 0,
+            last_symbol: None,
+            picker: LensPicker::new(Vec::new(), PickerParams::default()),
+            current_lens: String::new(),
+            lens_request: None,
+            buttons: LensButtons::default(),
             viewport: Viewport::new(1, 1),
         }
     }
@@ -150,6 +161,73 @@ impl BarcleanApp {
 
     pub fn frames(&self) -> u64 {
         self.frames
+    }
+
+    /// One-line diagnostic for logcat and, shortly, the on-screen status text.
+    pub fn status_line(&self) -> String {
+        match &self.state {
+            DecodeState::NoFrames => "no frames".to_string(),
+            DecodeState::Searching => format!(
+                "searching  {}x{}  rot{}",
+                self.frame.width, self.frame.height, self.frame.rotation
+            ),
+            DecodeState::Decoded(p) => format!("decoded: {p}"),
+            DecodeState::Recovered {
+                payload,
+                rescued,
+                total,
+            } => format!("RECOVERED {rescued}/{total} blocks: {payload}"),
+            DecodeState::TooDamaged { decoded, total } => {
+                format!("too damaged: {decoded}/{total} blocks")
+            }
+            DecodeState::Uncleaned { payload, format } => {
+                format!("{format} (uncleaned): {payload}")
+            }
+        }
+    }
+
+    /// Milliseconds the last decode attempt took.
+    pub fn last_decode_ms(&self) -> u32 {
+        self.last_decode_ms
+    }
+
+    pub fn lenses(&self) -> &[LensSpec] {
+        self.picker.lenses()
+    }
+
+    pub fn current_lens(&self) -> &str {
+        &self.current_lens
+    }
+
+    /// Install the physical lenses the shim enumerated.
+    pub fn set_lenses(&mut self, lenses: Vec<LensSpec>, current: &str) {
+        self.picker = LensPicker::new(lenses, PickerParams::default());
+        self.current_lens = current.to_string();
+        self.pending_frame = true;
+    }
+
+    /// Record which physical camera is now streaming.
+    pub fn set_current_lens(&mut self, id: &str) {
+        self.current_lens = id.to_string();
+        self.picker.clear_focus_failures();
+        self.pending_frame = true;
+    }
+
+    /// Take a pending lens switch, if the user tapped one. Polled by the shim each frame.
+    pub fn take_lens_request(&mut self) -> Option<String> {
+        self.lens_request.take()
+    }
+
+    /// Pixels per module measured on the current frame, if a symbol was located.
+    ///
+    /// Derived from the symbol's module count against its extent in the frame. Feeds the picker's
+    /// per-lens predictions, which is the number that makes a lens choice informed rather than a
+    /// guess.
+    fn measured_px_per_module(&self) -> (f32, u32) {
+        match self.last_symbol {
+            Some((dimension, px_per_module)) => (px_per_module, dimension as u32),
+            None => (0.0, 0),
+        }
     }
 
     /// Accept one camera frame's luminance plane.
@@ -191,7 +269,10 @@ impl BarcleanApp {
         };
         self.frames += 1;
         self.pending_frame = true;
+
+        let started = std::time::Instant::now();
         self.decode();
+        self.last_decode_ms = started.elapsed().as_millis() as u32;
     }
 
     /// Run the full cleaning path on the current frame.
@@ -215,6 +296,7 @@ impl BarcleanApp {
             self.frame.height as u32,
         ) {
             Ok(c) if c.needed_barclean() => {
+                self.last_symbol = Some((c.dimension, c.px_per_module));
                 let (rescued, total) = (c.blocks_rescued(), c.blocks_total);
                 DecodeState::Recovered {
                     payload: c.payload,
@@ -222,7 +304,10 @@ impl BarcleanApp {
                     total,
                 }
             }
-            Ok(c) => DecodeState::Decoded(c.payload),
+            Ok(c) => {
+                self.last_symbol = Some((c.dimension, c.px_per_module));
+                DecodeState::Decoded(c.payload)
+            }
             Err(crate::clean::CleanError::Unrecoverable {
                 blocks_total,
                 blocks_decoded,
@@ -230,8 +315,29 @@ impl BarcleanApp {
                 decoded: blocks_decoded,
                 total: blocks_total,
             },
-            Err(_) => DecodeState::Searching,
+            Err(_) => self.stock_fallback(),
         };
+    }
+
+    /// Stock multi-format decode, tried when the QR cleaner finds nothing.
+    ///
+    /// Two jobs. It makes the app read the three symbologies whose cleaning is not wired yet, and
+    /// it is the diagnostic that separates a detection failure from a cleaning failure — if this
+    /// succeeds where the cleaner did not, the camera and the imaging path are fine and the problem
+    /// is downstream.
+    fn stock_fallback(&self) -> DecodeState {
+        match rxing::helpers::detect_in_luma(
+            self.frame.luma.clone(),
+            self.frame.width as u32,
+            self.frame.height as u32,
+            None,
+        ) {
+            Ok(r) => DecodeState::Uncleaned {
+                payload: r.getText().to_string(),
+                format: format!("{:?}", r.getBarcodeFormat()),
+            },
+            Err(_) => DecodeState::Searching,
+        }
     }
 
     /// Blit the camera preview, letterboxed to preserve aspect ratio.
@@ -260,37 +366,57 @@ impl BarcleanApp {
                 let v = self.frame.sample_upright(sx, sy);
                 let idx = (oy + y) * w + (ox + x);
                 if idx < target.len() {
-                    target[idx] = colour(v, v, v, 255);
+                    // Under, not assign: the chrome was already painted on top of this.
+                    target[idx] =
+                        target[idx].under(colour(v, v, v, 255), BlendMode::Normal);
                 }
             }
         }
     }
 
-    /// A status band across the bottom, colour-coded by decode state.
-    ///
-    /// Colour rather than text for the moment: it is legible at a glance while pointing a phone at
-    /// something, which is exactly the posture this gets used in.
-    fn draw_status(&self, target: &mut [u32], w: usize, h: usize) {
-        let colour = match &self.state {
-            DecodeState::NoFrames => colour(180, 40, 40, 255),
-            DecodeState::Searching => colour(200, 150, 30, 255),
-            DecodeState::Decoded(_) => colour(40, 170, 80, 255),
-            // Distinct from a plain decode on purpose: this is the case barclean exists for, and
-            // it should be visible that the symbol needed rescuing rather than merely reading.
-            DecodeState::Recovered { .. } => colour(80, 140, 230, 255),
-            DecodeState::TooDamaged { .. } => colour(190, 90, 30, 255),
-        };
-        let band = (h / 12).max(8);
-        let y0 = h.saturating_sub(band);
-        for y in y0..h {
-            for x in 0..w {
-                let idx = y * w + x;
-                if idx < target.len() {
-                    target[idx] = colour;
-                }
-            }
+    /// Accent colour, headline and payload for the status readout.
+    fn status_parts(&self) -> (u32, String, Option<String>) {
+        match &self.state {
+            DecodeState::NoFrames => (
+                colour(180, 40, 40, 255),
+                "waiting for camera".into(),
+                None,
+            ),
+            DecodeState::Searching => (
+                colour(200, 150, 30, 255),
+                "searching…".into(),
+                Some(format!(
+                    "{}x{}  {} ms/frame",
+                    self.frame.width, self.frame.height, self.last_decode_ms
+                )),
+            ),
+            DecodeState::Decoded(p) => (
+                colour(40, 170, 80, 255),
+                "decoded".into(),
+                Some(p.clone()),
+            ),
+            DecodeState::Recovered {
+                payload,
+                rescued,
+                total,
+            } => (
+                colour(80, 140, 230, 255),
+                format!("RECOVERED — {rescued} of {total} blocks rescued"),
+                Some(payload.clone()),
+            ),
+            DecodeState::TooDamaged { decoded, total } => (
+                colour(190, 90, 30, 255),
+                format!("too damaged — {decoded}/{total} blocks"),
+                None,
+            ),
+            DecodeState::Uncleaned { payload, format } => (
+                colour(150, 90, 200, 255),
+                format!("{format} (cleaning not wired)"),
+                Some(payload.clone()),
+            ),
         }
     }
+
 }
 
 impl FluorApp for BarcleanApp {
@@ -308,7 +434,21 @@ impl FluorApp for BarcleanApp {
         self.viewport = Viewport::new(width, height);
     }
 
-    fn on_event(&mut self, _event: &FEvent, _ctx: &mut Context) -> EventResponse {
+    fn on_event(&mut self, event: &FEvent, _ctx: &mut Context) -> EventResponse {
+        // Selection happens on press rather than release: a lens change is cheap, reversible, and
+        // the user is holding a phone one-handed at something. Waiting for a clean press-release on
+        // the same target is the right rule for destructive actions, not for this.
+        if let FEvent::MouseInput { state, .. } = event {
+            if matches!(state, fluor::event::ElementState::Pressed) {
+                if let Some(id) = self.buttons.hit(_ctx.cursor_x, _ctx.cursor_y) {
+                    if id != self.current_lens {
+                        self.lens_request = Some(id.to_string());
+                    }
+                    self.pending_frame = true;
+                    return EventResponse::Handled;
+                }
+            }
+        }
         EventResponse::Pass
     }
 
@@ -329,16 +469,37 @@ impl FluorApp for BarcleanApp {
         let w = ctx.viewport.width_px as usize;
         let h = ctx.viewport.height_px as usize;
 
-        // Opaque near-black ground. fluor stores α + *darkness* — the top byte is opacity, the low
-        // three are the complement of visible RGB — but `pack_argb` takes ordinary RGB and does the
-        // inversion, so this reads as it looks.
-        let ground = colour(10, 10, 12, 255);
+        // FRONT TO BACK. fluor paints the topmost layer first and stops at a pixel once it is
+        // opaque, so this reads in the opposite order to a painter's-algorithm renderer: chrome,
+        // then the preview beneath it, then the ground behind everything. Start from an empty
+        // buffer — 0x00000000 is "nothing here yet", not black.
         for px in target.iter_mut().take(w * h) {
-            *px = ground;
+            *px = 0;
         }
 
+        let (px_per_module, modules) = self.measured_px_per_module();
+        let options = self
+            .picker
+            .options(&self.current_lens, px_per_module, modules);
+        let suggestion = self.picker.suggestion(&options);
+
+        let (accent, headline, detail) = self.status_parts();
+        let bar_h = if options.is_empty() {
+            0.0
+        } else {
+            (h as f32 * 0.10).max(ctx.viewport.effective_span() * 0.06)
+        };
+
+        self.buttons = ui::draw_lens_picker(target, ctx, &options, suggestion.as_deref());
+        ui::draw_status(target, ctx, accent, &headline, detail.as_deref(), bar_h);
+
         self.blit_preview(target, w, h);
-        self.draw_status(target, w, h);
+
+        // Ground last, behind everything, filling the letterbox bars.
+        let ground = colour(10, 10, 12, 255);
+        for px in target.iter_mut().take(w * h) {
+            *px = (*px).under(ground, BlendMode::Normal);
+        }
     }
 }
 
@@ -433,7 +594,6 @@ mod tests {
             let (w, h) = (40usize, 30usize);
             let mut target = vec![0u32; w * h];
             app.blit_preview(&mut target, w, h);
-            app.draw_status(&mut target, w, h);
             assert!(
                 target.iter().any(|&p| p != 0),
                 "{fw}x{fh} frame produced no output at all"

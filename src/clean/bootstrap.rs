@@ -98,6 +98,9 @@ pub struct BootstrapOutcome {
     pub damaged_codeword_modules: Vec<usize>,
     /// The fitted occlusion, if there was ever enough evidence to fit one.
     pub region: Option<OcclusionMask>,
+    /// Final per-block state, carrying each block's corrected codewords. Needed to reassemble the
+    /// corrected stream for an exact re-render.
+    pub blocks: Vec<BlockState>,
 }
 
 impl BootstrapOutcome {
@@ -239,6 +242,7 @@ pub fn bootstrap(
         data,
         damaged_codeword_modules,
         region,
+        blocks: states,
     }
 }
 

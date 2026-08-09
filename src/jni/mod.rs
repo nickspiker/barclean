@@ -10,7 +10,7 @@
 
 use crate::app::BarcleanApp;
 use fluor::host::android::AndroidShell;
-use jni::objects::{JByteArray, JClass, JObject};
+use jni::objects::{JByteArray, JClass, JObject, JString};
 use jni::sys::{jboolean, jfloat, jint, jlong};
 use jni::JNIEnv;
 use log::{error, info};
@@ -137,13 +137,109 @@ pub extern "C" fn Java_com_barclean_BarcleanActivity_nativeOnCameraFrame(
     };
     // JNI hands back i8; the plane is unsigned.
     let luma: Vec<u8> = bytes.into_iter().map(|b| b as u8).collect();
-    ctx.shell.app().on_camera_frame(
+    let app = ctx.shell.app();
+    app.on_camera_frame(
         &luma,
         width.max(0) as usize,
         height.max(0) as usize,
         row_stride.max(0) as usize,
         rotation.max(0) as u32,
     );
+
+    // Every 30th frame, roughly once a second. Enough to see what the decoder is concluding and
+    // how long it is taking without flooding logcat at frame rate.
+    if app.frames() % 30 == 0 {
+        info!(
+            "frame {} ({} ms): {}",
+            app.frames(),
+            app.last_decode_ms(),
+            app.status_line()
+        );
+    }
+}
+
+/// Report one physical lens the shim enumerated.
+///
+/// Called once per lens before streaming starts. Kotlin owns enumeration because only it can read
+/// `CameraCharacteristics`; everything after that — annotating each lens with what it would deliver,
+/// laying out the picker, resolving a tap — is Rust.
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub extern "C" fn Java_com_barclean_BarcleanActivity_nativeAddLens(
+    mut env: JNIEnv<'_>,
+    _class: JClass<'_>,
+    ptr: jlong,
+    id: JString<'_>,
+    label: JString<'_>,
+    focal_length_mm: jfloat,
+    sensor_width_mm: jfloat,
+    pixel_width: jint,
+    min_focus_distance_m: jfloat,
+) {
+    let Some(ctx) = context(ptr) else {
+        return;
+    };
+    let (Ok(id), Ok(label)) = (env.get_string(&id), env.get_string(&label)) else {
+        error!("lens id/label not readable");
+        return;
+    };
+    let spec = crate::camera::LensSpec {
+        id: id.to_string_lossy().into_owned(),
+        label: label.to_string_lossy().into_owned(),
+        focal_length_mm,
+        sensor_width_mm,
+        pixel_width: pixel_width.max(0) as u32,
+        min_focus_distance_m,
+    };
+    info!(
+        "lens {} ({}): {:.2}mm on {:.2}mm sensor",
+        spec.id, spec.label, spec.focal_length_mm, spec.sensor_width_mm
+    );
+
+    let app = ctx.shell.app();
+    let mut lenses: Vec<crate::camera::LensSpec> = app.lenses().to_vec();
+    lenses.push(spec);
+    let current = app.current_lens().to_string();
+    app.set_lenses(lenses, &current);
+}
+
+/// Tell Rust which physical camera is now streaming.
+#[unsafe(no_mangle)]
+pub extern "C" fn Java_com_barclean_BarcleanActivity_nativeSetCurrentLens(
+    mut env: JNIEnv<'_>,
+    _class: JClass<'_>,
+    ptr: jlong,
+    id: JString<'_>,
+) {
+    let Some(ctx) = context(ptr) else {
+        return;
+    };
+    if let Ok(id) = env.get_string(&id) {
+        ctx.shell.app().set_current_lens(&id.to_string_lossy());
+    }
+}
+
+/// Per-frame poll for a lens the user tapped.
+///
+/// A poll rather than a callback because reconfiguring the capture session has to happen on the
+/// camera thread, and calling back into Java from inside a render pass to get there is a deadlock
+/// waiting to happen. Returns `null` when nothing was requested.
+#[unsafe(no_mangle)]
+pub extern "C" fn Java_com_barclean_BarcleanActivity_nativePollLensRequest<'local>(
+    env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    ptr: jlong,
+) -> jni::sys::jstring {
+    let Some(ctx) = context(ptr) else {
+        return std::ptr::null_mut();
+    };
+    match ctx.shell.app().take_lens_request() {
+        Some(id) => env
+            .new_string(id)
+            .map(|s| s.into_raw())
+            .unwrap_or(std::ptr::null_mut()),
+        None => std::ptr::null_mut(),
+    }
 }
 
 #[unsafe(no_mangle)]

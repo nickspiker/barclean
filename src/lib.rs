@@ -75,6 +75,8 @@
 #[cfg(feature = "gui")]
 pub mod app;
 pub mod camera;
+#[cfg(feature = "gui")]
+pub mod ui;
 
 #[cfg(all(target_os = "android", feature = "gui"))]
 pub mod jni;

@@ -8,6 +8,7 @@ use crate::clean::bootstrap::{BootstrapOutcome, BootstrapParams, bootstrap};
 use crate::clean::erasure::BlockLayout;
 use rxing::common::reedsolomon::{PredefinedGenericGF, ReedSolomonDecoder};
 use rxing::common::{BitMatrix, DetectorRXingResult, HybridBinarizer};
+use rxing::qrcode::common::ErrorCorrectionLevel;
 use rxing::qrcode::decoder::{BitMatrixParser, DataBlock, build_block_map, decoded_bit_stream_parser};
 use rxing::qrcode::detector::Detector;
 use rxing::{BinaryBitmap, DecodeHints, Luma8LuminanceSource};
@@ -18,6 +19,14 @@ pub struct Cleaned {
     pub payload: String,
     /// Symbol width in modules.
     pub dimension: usize,
+    /// Pixels per module in the source image, measured from the detector's finder-pattern centres.
+    ///
+    /// `0.0` when the symbol did not come from a real detection (the grading harness feeds bit
+    /// matrices directly). This is the number the lens picker's predictions are built on, so it has
+    /// to be measured rather than estimated from the frame size — the symbol occupies whatever
+    /// fraction of the frame it occupies, and guessing that it fills the frame makes every other
+    /// lens look like it would crop.
+    pub px_per_module: f32,
     pub blocks_total: usize,
     /// Blocks that decoded before any bootstrapping — what a stock decoder would have managed.
     pub blocks_decoded_initially: usize,
@@ -27,9 +36,32 @@ pub struct Cleaned {
     /// later the reconstruction mask. See `BootstrapOutcome::damaged_codeword_modules` for why this
     /// is codeword-granular rather than module-granular.
     pub damaged_modules: Vec<usize>,
+    /// The corrected codeword stream — data and error correction, both repaired.
+    ///
+    /// This, not the payload, is what a pristine re-render is built from. See
+    /// [`crate::render::exact`] for why re-encoding the decoded text would produce a different
+    /// symbol.
+    pub codewords: Vec<u8>,
+    pub version: u32,
+    pub ec_level: String,
+    pub mask: i32,
 }
 
 impl Cleaned {
+    /// Rebuild the pristine symbol this scan came from.
+    pub fn reconstruct(&self) -> Result<crate::render::Reconstructed, String> {
+        let version = rxing::qrcode::common::Version::getVersionForNumber(self.version)
+            .map_err(|e| e.to_string())?;
+        let ec = match self.ec_level.as_str() {
+            "L" => ErrorCorrectionLevel::L,
+            "M" => ErrorCorrectionLevel::M,
+            "Q" => ErrorCorrectionLevel::Q,
+            "H" => ErrorCorrectionLevel::H,
+            other => return Err(format!("unknown error-correction level {other:?}")),
+        };
+        crate::render::from_codewords(&self.codewords, version, ec, self.mask)
+    }
+
     /// Blocks recovered purely by bootstrapping — what barclean added over a stock decode.
     pub fn blocks_rescued(&self) -> usize {
         self.blocks_total
@@ -74,28 +106,95 @@ impl core::fmt::Display for CleanError {
 pub fn clean_luma(luma: &[u8], width: u32, height: u32) -> Result<Cleaned, CleanError> {
     let source = Luma8LuminanceSource::new(luma.to_vec(), width, height)
         .map_err(|_| CleanError::NotDetected)?;
-    let mut bitmap = BinaryBitmap::new(HybridBinarizer::new(source));
+    let bitmap = BinaryBitmap::new(HybridBinarizer::new(source));
     let hints = DecodeHints::default();
 
     let detected = Detector::new(bitmap.get_black_matrix())
         .detect_with_hints(&hints)
         .map_err(|_| CleanError::NotDetected)?;
 
-    clean_bitmatrix(detected.getBits().clone())
+    // Finder-pattern centres sit at module (3.5, 3.5) from each of three corners, so the two
+    // adjacent pairs are (dimension - 7) modules apart and the third pair is that times root two.
+    // Taking the minimum pairwise distance picks an adjacent pair regardless of the order the
+    // detector returns them in.
+    let points = detected.getPoints();
+    let span_px = (0..points.len())
+        .flat_map(|i| ((i + 1)..points.len()).map(move |j| (i, j)))
+        .map(|(i, j)| {
+            let (dx, dy) = (points[i].x - points[j].x, points[i].y - points[j].y);
+            (dx * dx + dy * dy).sqrt()
+        })
+        .fold(f32::INFINITY, f32::min);
+
+    let bits = detected.getBits().clone();
+    let dimension = bits.getHeight() as usize;
+    let mut cleaned = clean_bitmatrix(bits)?;
+    if span_px.is_finite() && dimension > 7 {
+        cleaned.px_per_module = span_px / (dimension - 7) as f32;
+    }
+    Ok(cleaned)
 }
 
 /// Clean an already-detected, grid-sampled symbol.
 ///
 /// Split out from [`clean_luma`] so the grading harness can drive the algebra directly, without an
 /// imaging pipeline in the measurement.
+///
+/// Tries a normal read, then a **mirrored** one. That second attempt is not optional: the detector
+/// resolves a symbol's orientation from its three finder patterns, which are symmetric about the
+/// diagonal, so a perfectly good symbol is routinely sampled transposed. The stock decoder retries
+/// mirrored for exactly this reason, and without it a large share of real-world scans arrive here
+/// as unreadable structure or codewords that decode to nothing — which on-device looked like
+/// "0 of 2 blocks recovered" on codes a stock reader handled without complaint.
 pub fn clean_bitmatrix(bits: BitMatrix) -> Result<Cleaned, CleanError> {
     let dimension = bits.getHeight() as usize;
+
     let mut parser = BitMatrixParser::new(bits).map_err(|_| CleanError::Unreadable)?;
+    let first = clean_with_parser(&mut parser, dimension);
+    if let Ok(cleaned) = first {
+        return Ok(cleaned);
+    }
+
+    // Mirrored retry, mirroring the stock decoder's own recovery path.
+    if parser.remask().is_err() {
+        return first;
+    }
+    parser.setMirror(true);
+    if parser.readVersion().is_err() || parser.readFormatInformation().is_err() {
+        return first;
+    }
+    parser.mirror();
+
+    match clean_with_parser(&mut parser, dimension) {
+        Ok(cleaned) => Ok(cleaned),
+        // Report whichever attempt got further, so the UI's "how close was that" is honest.
+        Err(second) => Err(further_of(first.err(), second)),
+    }
+}
+
+/// Pick the more informative of two failures — the one that decoded more blocks.
+fn further_of(first: Option<CleanError>, second: CleanError) -> CleanError {
+    let progress = |e: &CleanError| match e {
+        CleanError::Unrecoverable { blocks_decoded, .. } => *blocks_decoded as i32,
+        CleanError::Unreadable => -1,
+        CleanError::NotDetected => -2,
+    };
+    match first {
+        Some(f) if progress(&f) >= progress(&second) => f,
+        _ => second,
+    }
+}
+
+fn clean_with_parser(
+    parser: &mut BitMatrixParser,
+    dimension: usize,
+) -> Result<Cleaned, CleanError> {
     let version = parser.readVersion().map_err(|_| CleanError::Unreadable)?;
-    let ec_level = parser
+    let format = parser
         .readFormatInformation()
-        .map_err(|_| CleanError::Unreadable)?
-        .getErrorCorrectionLevel();
+        .map_err(|_| CleanError::Unreadable)?;
+    let ec_level = format.getErrorCorrectionLevel();
+    let mask = format.getDataMask() as i32;
 
     let (raw, provenance) = parser
         .read_codewords_with_provenance()
@@ -137,6 +236,20 @@ pub fn clean_bitmatrix(bits: BitMatrix) -> Result<Cleaned, CleanError> {
         &BootstrapParams::default(),
     );
 
+    // Reassemble the corrected interleaved stream. Every block's codewords came back repaired —
+    // error correction included — so writing them back through the block map reproduces exactly
+    // what `readCodewords` would have returned from an undamaged symbol.
+    let mut corrected = raw.clone();
+    for state in &outcome.blocks {
+        if let Some(block) = &state.codewords {
+            for (local, &cw) in block.iter().enumerate() {
+                if let Some(g) = to_global(state.index, local) {
+                    corrected[g] = cw;
+                }
+            }
+        }
+    }
+
     let Some(data) = outcome.data.clone() else {
         return Err(CleanError::Unrecoverable {
             blocks_total: outcome.blocks_total,
@@ -150,10 +263,15 @@ pub fn clean_bitmatrix(bits: BitMatrix) -> Result<Cleaned, CleanError> {
     Ok(Cleaned {
         payload: parsed.getText().to_string(),
         dimension,
+        px_per_module: 0.0,
         blocks_total: outcome.blocks_total,
         blocks_decoded_initially: outcome.blocks_decoded_initially,
         rounds: outcome.rounds,
         damaged_modules: outcome.damaged_codeword_modules,
+        codewords: corrected,
+        version: version.getVersionNumber(),
+        ec_level: format!("{ec_level}"),
+        mask,
     })
 }
 
@@ -289,5 +407,51 @@ mod tests {
             Err(other) => panic!("expected Unrecoverable, got {other:?}"),
             Ok(c) => panic!("45% at ECC-L should not recover, got {:?}", c.payload),
         }
+    }
+
+    #[test]
+    fn a_defaced_symbol_reconstructs_to_the_pristine_original() {
+        // The whole product, end to end: take a symbol, cover a fifth of it, recover it, and rebuild
+        // the original. Compared module-by-module against the undamaged encode — payload equality
+        // would pass while emitting a differently-segmented symbol, which is a re-creation rather
+        // than a restoration.
+        let pristine = symbol::generate(Symbology::QrCode, PAYLOAD, "H").unwrap();
+
+        let cleaned = clean_bitmatrix(defaced("H", 0.20)).expect("recover");
+        assert_eq!(cleaned.payload, PAYLOAD);
+
+        let rebuilt = cleaned.reconstruct().expect("reconstruct");
+        assert_eq!(rebuilt.dimension, pristine.truth.width);
+        assert_eq!(
+            rebuilt.differences(pristine.truth.modules()),
+            Some(0),
+            "the rebuilt symbol is not bit-identical to the original"
+        );
+    }
+
+    #[test]
+    fn reconstruction_survives_a_bootstrapped_rescue() {
+        // Reconstruction depends on the corrected codewords being reassembled from every block,
+        // including the ones that only came back via erasure decoding. A block rescued late must
+        // contribute its repaired codewords like any other.
+        let pristine = symbol::generate(Symbology::QrCode, PAYLOAD, "Q").unwrap();
+
+        let mut proved = false;
+        for step in 19..=25u32 {
+            let Ok(cleaned) = clean_bitmatrix(defaced("Q", step as f32 * 0.01)) else {
+                continue;
+            };
+            if !cleaned.needed_barclean() {
+                continue;
+            }
+            proved = true;
+            let rebuilt = cleaned.reconstruct().expect("reconstruct after rescue");
+            assert_eq!(
+                rebuilt.differences(pristine.truth.modules()),
+                Some(0),
+                "rescued at {step}%: rebuilt symbol differs from the original"
+            );
+        }
+        assert!(proved, "no bootstrapped rescue occurred, so nothing was proved");
     }
 }

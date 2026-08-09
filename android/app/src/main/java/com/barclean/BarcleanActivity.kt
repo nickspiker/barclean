@@ -10,6 +10,8 @@ import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraDevice
 import android.hardware.camera2.CameraManager
 import android.hardware.camera2.CaptureRequest
+import android.hardware.camera2.params.OutputConfiguration
+import android.hardware.camera2.params.SessionConfiguration
 import android.media.ImageReader
 import android.os.Build
 import android.os.Bundle
@@ -56,6 +58,17 @@ class BarcleanActivity : Activity(), SurfaceHolder.Callback {
         rowStride: Int,
         rotationDegrees: Int
     )
+    private external fun nativeAddLens(
+        ptr: Long,
+        id: String,
+        label: String,
+        focalLengthMm: Float,
+        sensorWidthMm: Float,
+        pixelWidth: Int,
+        minFocusDistanceM: Float
+    )
+    private external fun nativeSetCurrentLens(ptr: Long, id: String)
+    private external fun nativePollLensRequest(ptr: Long): String?
     private external fun nativeDestroy(ptr: Long)
 
     private var nativePtr = 0L
@@ -80,6 +93,12 @@ class BarcleanActivity : Activity(), SurfaceHolder.Callback {
      */
     private var sensorOrientation = 0
 
+    /** Physical camera ids behind the logical camera, widest first. */
+    private var physicalLensIds: List<String> = emptyList()
+
+    /** The physical lens currently streaming. */
+    private var currentLensId: String = ""
+
     private val frameCallback = object : Choreographer.FrameCallback {
         override fun doFrame(frameTimeNanos: Long) {
             if (nativePtr != 0L && surfaceReady) {
@@ -87,6 +106,7 @@ class BarcleanActivity : Activity(), SurfaceHolder.Callback {
                 if (holder.surface.isValid) {
                     nativeDraw(nativePtr, holder.surface)
                 }
+                nativePollLensRequest(nativePtr)?.let { selectPhysicalLens(it) }
             }
             Choreographer.getInstance().postFrameCallback(this)
         }
@@ -187,12 +207,16 @@ class BarcleanActivity : Activity(), SurfaceHolder.Callback {
     }
 
     /**
-     * Enumerate the physical lenses behind a logical multi-camera.
+     * Enumerate the physical lenses behind a logical multi-camera and report them to Rust.
      *
-     * A modern phone exposes one logical camera that fronts three or four physical modules with
-     * genuinely different angular resolutions. Choosing between them is barclean's whole camera
-     * story, so the specs are read here and handed to Rust, which annotates them for the picker.
-     * Reported but not yet wired to a control — that is the next step.
+     * A modern phone exposes one logical camera fronting three or four physical modules with
+     * genuinely different angular resolutions. Only Kotlin can read `CameraCharacteristics`, so
+     * enumeration happens here — everything after that (predicting what each lens would deliver,
+     * laying out the picker, resolving a tap) is Rust.
+     *
+     * `LENS_INFO_MINIMUM_FOCUS_DISTANCE` is reported in **diopters**, not metres: 10.0 means 10 cm,
+     * and 0.0 means fixed-focus rather than "focuses at zero distance". Reading it as metres would
+     * mark every lens as capable of focusing anywhere.
      */
     private fun describeLenses(manager: CameraManager, logicalId: String) {
         val characteristics = manager.getCameraCharacteristics(logicalId)
@@ -206,22 +230,69 @@ class BarcleanActivity : Activity(), SurfaceHolder.Callback {
             emptySet()
         }
 
-        val ids = if (physicalIds.isEmpty()) setOf(logicalId) else physicalIds
+        val ids = (if (physicalIds.isEmpty()) setOf(logicalId) else physicalIds).toList()
+        physicalLensIds = ids
+
+        data class Lens(val id: String, val focal: Float, val sensorW: Float, val minFocusM: Float)
+        val lenses = mutableListOf<Lens>()
         for (id in ids) {
             try {
                 val c = manager.getCameraCharacteristics(id)
                 val focal = c.get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)
-                val size = c.get(CameraCharacteristics.SENSOR_INFO_PHYSICAL_SIZE)
-                val minFocus = c.get(CameraCharacteristics.LENS_INFO_MINIMUM_FOCUS_DISTANCE)
-                Log.i(
-                    TAG,
-                    "lens $id: focal=${focal?.joinToString()} sensor=${size?.width}x${size?.height}mm " +
-                        "minFocusDiopters=$minFocus"
-                )
+                    ?.firstOrNull() ?: continue
+                val size = c.get(CameraCharacteristics.SENSOR_INFO_PHYSICAL_SIZE) ?: continue
+                val diopters = c.get(CameraCharacteristics.LENS_INFO_MINIMUM_FOCUS_DISTANCE) ?: 0f
+                val minFocusM = if (diopters > 0f) 1f / diopters else 0f
+                lenses.add(Lens(id, focal, size.width, minFocusM))
             } catch (e: Throwable) {
                 Log.w(TAG, "lens $id unreadable: ${e.message}")
             }
         }
+
+        // Collapse cropped-mode duplicates. The Pixel exposes each module twice — once at full
+        // sensor and once as a cropped sub-frame with the same focal length — which would show the
+        // user two identical "1x" buttons. Keep the larger sensor of each focal length, since that
+        // is the one with the pixels.
+        val deduped = lenses
+            .groupBy { String.format("%.2f", it.focal) }
+            .values
+            .map { group -> group.maxByOrNull { it.sensorW }!! }
+
+        // Label by focal length relative to the main camera, which is how phone camera UIs read:
+        // the ultra-wide is the 0.5x, the main is 1x, the telephoto is whatever multiple it is.
+        val widest = deduped.minByOrNull { it.focal }?.focal ?: 1f
+        val main = deduped.filter { it.focal > widest * 1.5f }.minByOrNull { it.focal }?.focal
+            ?: widest
+        for (l in deduped.sortedBy { it.focal }) {
+            val ratio = l.focal / main
+            val label = when {
+                ratio < 0.75f -> String.format("%.1fx", ratio)
+                ratio < 1.25f -> "1x"
+                else -> String.format("%.0fx", ratio)
+            }
+            nativeAddLens(nativePtr, l.id, label, l.focal, l.sensorW, 1280, l.minFocusM)
+        }
+    }
+
+    /**
+     * Switch the capture session to a physical lens the user picked.
+     *
+     * Rebuilds the request with `setPhysicalCameraId` rather than reopening the camera, which keeps
+     * the switch fast enough to feel like a button press instead of a restart.
+     */
+    private fun selectPhysicalLens(id: String) {
+        if (id == currentLensId) return
+        val camera = cameraDevice ?: return
+        val reader = imageReader ?: return
+        currentLensId = id
+        nativeSetCurrentLens(nativePtr, id)
+        // A physical camera is chosen on the OUTPUT, not the request: setPhysicalCameraId lives on
+        // OutputConfiguration, so switching lenses means rebuilding the capture session rather than
+        // swapping a request field. Costs a session teardown, which is why the picker is a
+        // deliberate tap rather than anything automatic.
+        captureSession?.close()
+        captureSession = null
+        startSession(camera, reader)
     }
 
     private fun openCamera() {
@@ -241,6 +312,11 @@ class BarcleanActivity : Activity(), SurfaceHolder.Callback {
         Log.i(TAG, "sensor orientation ${sensorOrientation}deg")
 
         describeLenses(manager, cameraId)
+        currentLensId = physicalLensIds.firstOrNull { it != cameraId } ?: cameraId
+        // Default to the main camera when one is identifiable, matching what every camera app opens
+        // on — the widest is rarely the right first choice for reading something.
+        currentLensId = physicalLensIds.getOrNull(1) ?: physicalLensIds.firstOrNull() ?: cameraId
+        nativeSetCurrentLens(nativePtr, currentLensId)
 
         cameraThread = HandlerThread("barclean-camera").also { it.start() }
         cameraHandler = Handler(cameraThread!!.looper)
@@ -310,24 +386,40 @@ class BarcleanActivity : Activity(), SurfaceHolder.Callback {
             // is a legible symbol, not untouched photons.
             set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
             set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON)
+        }.build()
+
+        val callback = object : CameraCaptureSession.StateCallback() {
+            override fun onConfigured(session: CameraCaptureSession) {
+                captureSession = session
+                session.setRepeatingRequest(request, null, cameraHandler)
+                Log.i(TAG, "capture session running on lens $currentLensId")
+            }
+
+            override fun onConfigureFailed(session: CameraCaptureSession) {
+                Log.e(TAG, "capture session configuration failed for lens $currentLensId")
+            }
         }
 
-        @Suppress("DEPRECATION")
-        camera.createCaptureSession(
-            listOf(reader.surface),
-            object : CameraCaptureSession.StateCallback() {
-                override fun onConfigured(session: CameraCaptureSession) {
-                    captureSession = session
-                    session.setRepeatingRequest(request.build(), null, cameraHandler)
-                    Log.i(TAG, "capture session running")
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P && currentLensId.isNotEmpty()) {
+            val output = OutputConfiguration(reader.surface).apply {
+                // Only route to a physical id when it is genuinely one of the physical cameras;
+                // handing the logical id here fails configuration on some HALs.
+                if (physicalLensIds.contains(currentLensId)) {
+                    setPhysicalCameraId(currentLensId)
                 }
-
-                override fun onConfigureFailed(session: CameraCaptureSession) {
-                    Log.e(TAG, "capture session configuration failed")
-                }
-            },
-            cameraHandler
-        )
+            }
+            camera.createCaptureSession(
+                SessionConfiguration(
+                    SessionConfiguration.SESSION_REGULAR,
+                    listOf(output),
+                    mainExecutor,
+                    callback
+                )
+            )
+        } else {
+            @Suppress("DEPRECATION")
+            camera.createCaptureSession(listOf(reader.surface), callback, cameraHandler)
+        }
     }
 
     private fun closeCamera() {
