@@ -2,7 +2,13 @@ package com.barclean
 
 import android.Manifest
 import android.app.Activity
+import android.content.ContentValues
 import android.content.pm.PackageManager
+import android.os.Environment
+import android.provider.MediaStore
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 import android.graphics.ImageFormat
 import android.graphics.PixelFormat
 import android.hardware.camera2.CameraCaptureSession
@@ -69,6 +75,7 @@ class BarcleanActivity : Activity(), SurfaceHolder.Callback {
     )
     private external fun nativeSetCurrentLens(ptr: Long, id: String)
     private external fun nativePollLensRequest(ptr: Long): String?
+    private external fun nativePollSaveRequest(ptr: Long): ByteArray?
     private external fun nativeDestroy(ptr: Long)
 
     private var nativePtr = 0L
@@ -107,6 +114,7 @@ class BarcleanActivity : Activity(), SurfaceHolder.Callback {
                     nativeDraw(nativePtr, holder.surface)
                 }
                 nativePollLensRequest(nativePtr)?.let { selectPhysicalLens(it) }
+                nativePollSaveRequest(nativePtr)?.let { savePng(it) }
             }
             Choreographer.getInstance().postFrameCallback(this)
         }
@@ -203,6 +211,42 @@ class BarcleanActivity : Activity(), SurfaceHolder.Callback {
         if (nativePtr != 0L) {
             nativeDestroy(nativePtr)
             nativePtr = 0L
+        }
+    }
+
+    /**
+     * Write a cleaned symbol to the device's picture library.
+     *
+     * MediaStore rather than app-private storage, because the entire point of the export is to use
+     * the file somewhere else — it should land in Photos alongside everything else, not somewhere
+     * only this app can reach.
+     *
+     * Named for the moment of capture, in local time, as `2016-08-10 14:33:48.png`.
+     */
+    private fun savePng(png: ByteArray) {
+        val name = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(Date()) + ".png"
+        try {
+            val values = ContentValues().apply {
+                put(MediaStore.Images.Media.DISPLAY_NAME, name)
+                put(MediaStore.Images.Media.MIME_TYPE, "image/png")
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    put(
+                        MediaStore.Images.Media.RELATIVE_PATH,
+                        Environment.DIRECTORY_PICTURES + "/barclean"
+                    )
+                }
+            }
+            val uri = contentResolver.insert(
+                MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
+                values
+            ) ?: run {
+                Log.e(TAG, "MediaStore refused an entry for $name")
+                return
+            }
+            contentResolver.openOutputStream(uri)?.use { it.write(png) }
+            Log.i(TAG, "saved $name (${png.size} bytes) -> $uri")
+        } catch (e: Throwable) {
+            Log.e(TAG, "save failed for $name", e)
         }
     }
 

@@ -36,5 +36,7 @@
 //! and the overlay is the evidence for it.
 
 pub mod exact;
+pub mod export;
 
 pub use exact::{Reconstructed, from_codewords};
+pub use export::{ModuleVerdict, compare, quiet_zone_modules, timestamped_name, to_png};

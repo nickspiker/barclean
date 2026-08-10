@@ -242,6 +242,34 @@ pub extern "C" fn Java_com_barclean_BarcleanActivity_nativePollLensRequest<'loca
     }
 }
 
+/// Per-frame poll for a PNG the user asked to save.
+///
+/// Rust encodes; Kotlin writes. The split is deliberate — only the platform layer can reach
+/// MediaStore, and only Rust knows what the pristine symbol looks like. Returns `null` when nothing
+/// is pending.
+#[unsafe(no_mangle)]
+pub extern "C" fn Java_com_barclean_BarcleanActivity_nativePollSaveRequest<'local>(
+    env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    ptr: jlong,
+) -> jni::sys::jbyteArray {
+    let Some(ctx) = context(ptr) else {
+        return std::ptr::null_mut();
+    };
+    match ctx.shell.app().take_save_request() {
+        Some(png) => {
+            info!("save requested: {} byte PNG", png.len());
+            let signed: Vec<i8> = png.into_iter().map(|b| b as i8).collect();
+            env.byte_array_from_slice(unsafe {
+                std::slice::from_raw_parts(signed.as_ptr() as *const u8, signed.len())
+            })
+            .map(|a| a.into_raw())
+            .unwrap_or(std::ptr::null_mut())
+        }
+        None => std::ptr::null_mut(),
+    }
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn Java_com_barclean_BarcleanActivity_nativeDestroy(
     _env: JNIEnv<'_>,

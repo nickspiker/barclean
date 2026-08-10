@@ -14,7 +14,8 @@ use fluor::pixel::{Blend, BlendMode};
 use fluor::Viewport;
 
 use crate::camera::{LensPicker, LensSpec, PickerParams};
-use crate::ui::{self, LensButtons, colour};
+use crate::render::{ModuleVerdict, Reconstructed};
+use crate::ui::{self, LensButtons, ResultButtons, colour};
 
 /// The most recent camera frame's luminance plane.
 #[derive(Clone, Default)]
@@ -101,6 +102,46 @@ impl DecodeState {
     }
 }
 
+/// The frozen result of a successful scan.
+///
+/// Held rather than recomputed: at the moment of recovery we have the corrected codewords and the
+/// matrix they came from, and the very next camera frame would overwrite both. A recovery that took
+/// effort to get is not something to make the user earn twice.
+pub struct ResultView {
+    pub payload: String,
+    /// Source was light-on-dark; the export preserves that.
+    pub inverted: bool,
+    pub rebuilt: Reconstructed,
+    pub verdicts: Vec<ModuleVerdict>,
+    pub dimension: usize,
+    pub recovered: usize,
+    pub blocks_rescued: usize,
+    pub blocks_total: usize,
+}
+
+impl ResultView {
+    fn headline(&self) -> String {
+        if self.blocks_rescued > 0 {
+            format!(
+                "Recovered — {} of {} blocks rescued, {} modules repaired",
+                self.blocks_rescued, self.blocks_total, self.recovered
+            )
+        } else if self.recovered > 0 {
+            format!("Cleaned — {} modules repaired", self.recovered)
+        } else {
+            "Clean — nothing needed repairing".to_string()
+        }
+    }
+}
+
+/// Which screen the app is on.
+pub enum Screen {
+    Scanning,
+    /// Frozen on a successful scan. The camera keeps streaming (so returning is instant) but frames
+    /// no longer touch the decode state.
+    Result(Box<ResultView>),
+}
+
 pub struct BarcleanApp {
     frame: Frame,
     state: DecodeState,
@@ -129,6 +170,10 @@ pub struct BarcleanApp {
     /// waiting to happen.
     lens_request: Option<String>,
     buttons: LensButtons,
+    screen: Screen,
+    result_buttons: ResultButtons,
+    /// PNG bytes awaiting a write by the platform layer, polled each frame.
+    save_request: Option<Vec<u8>>,
     viewport: Viewport,
 }
 
@@ -151,6 +196,9 @@ impl BarcleanApp {
             current_lens: String::new(),
             lens_request: None,
             buttons: LensButtons::default(),
+            screen: Screen::Scanning,
+            result_buttons: ResultButtons::default(),
+            save_request: None,
             viewport: Viewport::new(1, 1),
         }
     }
@@ -200,8 +248,20 @@ impl BarcleanApp {
     }
 
     /// Install the physical lenses the shim enumerated.
+    ///
+    /// Idempotent by lens id. The shim re-enumerates whenever the camera is opened, which happens
+    /// on both `surfaceChanged` and `onResume`, so a naive append gave every lens a duplicate
+    /// button after the first resume. Deduplicating here rather than in Kotlin keeps the invariant
+    /// where it can be tested.
     pub fn set_lenses(&mut self, lenses: Vec<LensSpec>, current: &str) {
-        self.picker = LensPicker::new(lenses, PickerParams::default());
+        let mut unique: Vec<LensSpec> = Vec::with_capacity(lenses.len());
+        for lens in lenses {
+            match unique.iter_mut().find(|u| u.id == lens.id) {
+                Some(existing) => *existing = lens,
+                None => unique.push(lens),
+            }
+        }
+        self.picker = LensPicker::new(unique, PickerParams::default());
         self.current_lens = current.to_string();
         self.pending_frame = true;
     }
@@ -286,6 +346,11 @@ impl BarcleanApp {
     /// — that is what the perspective transform is for — so rotating first would cost a full copy
     /// per frame and resample module edges, which are the entire signal.
     fn decode(&mut self) {
+        // Frozen on a result: frames keep arriving so the preview is warm when the user returns,
+        // but nothing is allowed to overwrite the recovery they are looking at.
+        if matches!(self.screen, Screen::Result(_)) {
+            return;
+        }
         if self.frame.is_empty() {
             self.state = DecodeState::NoFrames;
             return;
@@ -295,18 +360,23 @@ impl BarcleanApp {
             self.frame.width as u32,
             self.frame.height as u32,
         ) {
-            Ok(c) if c.needed_barclean() => {
-                self.last_symbol = Some((c.dimension, c.px_per_module));
-                let (rescued, total) = (c.blocks_rescued(), c.blocks_total);
-                DecodeState::Recovered {
-                    payload: c.payload,
-                    rescued,
-                    total,
-                }
-            }
             Ok(c) => {
                 self.last_symbol = Some((c.dimension, c.px_per_module));
-                DecodeState::Decoded(c.payload)
+                let (rescued, total) = (c.blocks_rescued(), c.blocks_total);
+                let payload = c.payload.clone();
+                        // Freeze on any successful decode, not only a rescued one: a logo-branded code that
+                // reads fine still carries a logo the user wants gone, and the pristine rebuild is
+                // the thing they came for either way.
+                self.freeze(c);
+                if rescued > 0 {
+                    DecodeState::Recovered {
+                        payload,
+                        rescued,
+                        total,
+                    }
+                } else {
+                    DecodeState::Decoded(payload)
+                }
             }
             Err(crate::clean::CleanError::Unrecoverable {
                 blocks_total,
@@ -317,6 +387,45 @@ impl BarcleanApp {
             },
             Err(_) => self.stock_fallback(),
         };
+    }
+
+    /// Freeze a successful clean into the result screen.
+    fn freeze(&mut self, cleaned: crate::clean::Cleaned) {
+        let Ok(rebuilt) = cleaned.reconstruct() else {
+            return;
+        };
+        let Some(verdicts) = crate::render::compare(&rebuilt, &cleaned.sampled) else {
+            return;
+        };
+        let recovered = verdicts.iter().filter(|v| v.recovered()).count();
+        self.screen = Screen::Result(Box::new(ResultView {
+            inverted: cleaned.source_inverted,
+            payload: cleaned.payload,
+            dimension: rebuilt.dimension,
+            rebuilt,
+            verdicts,
+            recovered,
+            blocks_rescued: cleaned.blocks_total - cleaned.blocks_decoded_initially,
+            blocks_total: cleaned.blocks_total,
+        }));
+        self.pending_frame = true;
+    }
+
+    /// Return to the camera, discarding the frozen result.
+    fn resume_scanning(&mut self) {
+        self.screen = Screen::Scanning;
+        self.state = DecodeState::Searching;
+        self.pending_frame = true;
+    }
+
+    /// Take PNG bytes the user asked to save. Polled by the platform layer each frame.
+    pub fn take_save_request(&mut self) -> Option<Vec<u8>> {
+        self.save_request.take()
+    }
+
+    /// Whether the app is showing a frozen result.
+    pub fn is_frozen(&self) -> bool {
+        matches!(self.screen, Screen::Result(_))
     }
 
     /// Stock multi-format decode, tried when the QR cleaner finds nothing.
@@ -438,8 +547,43 @@ impl FluorApp for BarcleanApp {
         // Selection happens on press rather than release: a lens change is cheap, reversible, and
         // the user is holding a phone one-handed at something. Waiting for a clean press-release on
         // the same target is the right rule for destructive actions, not for this.
+        // Android's back button arrives as KEYCODE_ESCAPE via the shell, so leaving the result
+        // screen with Back works without a separate hook — and matches the desktop key.
+        if let FEvent::KeyboardInput { event: key, .. } = event {
+            if matches!(key.state, fluor::event::ElementState::Pressed)
+                && key.logical_key == fluor::event::Key::Named(fluor::event::NamedKey::Escape)
+                && self.is_frozen()
+            {
+                self.resume_scanning();
+                return EventResponse::Handled;
+            }
+        }
+
         if let FEvent::MouseInput { state, .. } = event {
             if matches!(state, fluor::event::ElementState::Pressed) {
+                if let Screen::Result(view) = &self.screen {
+                    let (x, y) = (_ctx.cursor_x, _ctx.cursor_y);
+                    if self.result_buttons.save.is_some_and(|hit| hit.contains(x, y)) {
+                        // Encode here, on the UI thread, because it is a few milliseconds for a
+                        // symbol-sized image and the alternative is threading a result back.
+                        match crate::render::to_png(
+                            &view.rebuilt,
+                            crate::Symbology::QrCode,
+                            12,
+                            view.inverted,
+                        ) {
+                            Ok(png) => self.save_request = Some(png),
+                            Err(e) => eprintln!("PNG encode failed: {e}"),
+                        }
+                        self.resume_scanning();
+                        return EventResponse::Handled;
+                    }
+                    if self.result_buttons.cancel.is_some_and(|hit| hit.contains(x, y)) {
+                        self.resume_scanning();
+                        return EventResponse::Handled;
+                    }
+                    return EventResponse::Handled;
+                }
                 if let Some(id) = self.buttons.hit(_ctx.cursor_x, _ctx.cursor_y) {
                     if id != self.current_lens {
                         self.lens_request = Some(id.to_string());
@@ -475,6 +619,18 @@ impl FluorApp for BarcleanApp {
         // buffer — 0x00000000 is "nothing here yet", not black.
         for px in target.iter_mut().take(w * h) {
             *px = 0;
+        }
+
+        if let Screen::Result(view) = &self.screen {
+            let (headline, payload) = (view.headline(), view.payload.clone());
+            let (dimension, verdicts) = (view.dimension, view.verdicts.clone());
+            self.result_buttons =
+                ui::draw_result(target, ctx, dimension, &verdicts, &headline, &payload);
+            let ground = colour(10, 10, 12, 255);
+            for px in target.iter_mut().take(w * h) {
+                *px = (*px).under(ground, BlendMode::Normal);
+            }
+            return;
         }
 
         let (px_per_module, modules) = self.measured_px_per_module();
@@ -549,6 +705,33 @@ mod tests {
         app.on_camera_frame(&[1, 2, 3], 10, 10, 10, 0);
         assert_eq!(app.frames(), 0);
         assert_eq!(*app.state(), DecodeState::NoFrames);
+    }
+
+    fn lens(id: &str, focal: f32) -> LensSpec {
+        LensSpec {
+            id: id.into(),
+            label: format!("{focal}mm"),
+            focal_length_mm: focal,
+            sensor_width_mm: 8.0,
+            pixel_width: 1280,
+            min_focus_distance_m: 0.1,
+        }
+    }
+
+    #[test]
+    fn re_enumerating_lenses_does_not_duplicate_buttons() {
+        // The shim re-enumerates on every camera open, which happens on surfaceChanged AND on
+        // onResume. Without deduplication every lens gained a second button after the first resume.
+        let mut app = BarcleanApp::new();
+        let three = vec![lens("3", 2.23), lens("2", 6.9), lens("4", 18.0)];
+
+        app.set_lenses(three.clone(), "2");
+        assert_eq!(app.lenses().len(), 3);
+
+        let mut twice = three.clone();
+        twice.extend(three);
+        app.set_lenses(twice, "2");
+        assert_eq!(app.lenses().len(), 3, "re-enumeration must not duplicate");
     }
 
     #[test]

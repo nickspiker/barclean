@@ -329,3 +329,122 @@ mod tests {
         assert_eq!(buttons.hit(10.0, 10.0), None);
     }
 }
+
+/// Where the result screen's buttons landed.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ResultButtons {
+    pub save: Option<Hit>,
+    pub cancel: Option<Hit>,
+}
+
+/// Draw the frozen result: the rebuilt symbol as a four-colour comparison, plus Save and Cancel.
+///
+/// The grid is the evidence. Blue and green are modules the camera already had right; red and
+/// yellow are ones barclean recovered. A logo's footprint shows up as a solid red-and-yellow patch,
+/// so the claim "this was reconstructed" is something you can see rather than something you have to
+/// take on faith.
+pub fn draw_result(
+    target: &mut [u32],
+    ctx: &mut Context,
+    dimension: usize,
+    verdicts: &[crate::render::ModuleVerdict],
+    headline: &str,
+    payload: &str,
+) -> ResultButtons {
+    let w = ctx.viewport.width_px as usize;
+    let h = ctx.viewport.height_px as usize;
+    if w == 0 || h == 0 || dimension == 0 || verdicts.len() != dimension * dimension {
+        return ResultButtons::default();
+    }
+    let span = ctx.viewport.effective_span();
+
+    // Buttons across the bottom, then the grid above them, then the header text.
+    let bar_h = (h as f32 * 0.11).max(span * 0.07);
+    let bar_y = h as f32 - bar_h;
+    let save = Hit { x0: 0.0, y0: bar_y, x1: w as f32 * 0.5, y1: h as f32 };
+    let cancel = Hit { x0: w as f32 * 0.5, y0: bar_y, x1: w as f32, y1: h as f32 };
+
+    for (hit, label, fill, ink) in [
+        (save, "Save PNG", colour(40, 150, 80, 255), colour(255, 255, 255, 255)),
+        (cancel, "Cancel", colour(45, 45, 52, 255), colour(225, 225, 230, 255)),
+    ] {
+        let mut canvas = Canvas::new(target, w, h, ctx.damage);
+        ctx.text.draw_text_center(
+            &mut canvas,
+            label,
+            (hit.x0 + hit.x1) * 0.5,
+            bar_y + bar_h * 0.5,
+            &TextStyle::new(span * 0.024, ink).weight(600),
+            None,
+            None,
+        );
+        let inset = span * 0.004;
+        fill_under(
+            target,
+            w,
+            h,
+            Hit { x0: hit.x0 + inset, y0: hit.y0 + inset, x1: hit.x1 - inset, y1: hit.y1 - inset },
+            fill,
+        );
+    }
+
+    // Header.
+    let head_y = span * 0.06;
+    let mut canvas = Canvas::new(target, w, h, ctx.damage);
+    ctx.text.draw_text_center(
+        &mut canvas,
+        headline,
+        w as f32 * 0.5,
+        head_y,
+        &TextStyle::new(span * 0.026, colour(245, 245, 250, 255)).weight(600),
+        None,
+        None,
+    );
+    let shown: String = if payload.chars().count() > 46 {
+        payload.chars().take(43).collect::<String>() + "…"
+    } else {
+        payload.to_string()
+    };
+    let mut canvas = Canvas::new(target, w, h, ctx.damage);
+    ctx.text.draw_text_center(
+        &mut canvas,
+        &shown,
+        w as f32 * 0.5,
+        head_y + span * 0.035,
+        &TextStyle::new(span * 0.017, colour(180, 190, 205, 255)),
+        None,
+        None,
+    );
+
+    // The grid, centred in the space between header and buttons. Integer module size so every
+    // module is the same number of pixels — an uneven grid reads as a rendering fault in exactly
+    // the kind of image whose whole purpose is to look precise.
+    let top = head_y + span * 0.07;
+    let avail_h = (bar_y - top).max(0.0);
+    let avail_w = w as f32 * 0.92;
+    let cell = (avail_w.min(avail_h) / dimension as f32).floor().max(1.0) as usize;
+    let grid_px = cell * dimension;
+    let gx = (w.saturating_sub(grid_px)) / 2;
+    let gy = top as usize + ((avail_h as usize).saturating_sub(grid_px)) / 2;
+
+    for my in 0..dimension {
+        for mx in 0..dimension {
+            let (r, g, b) = verdicts[my * dimension + mx].rgb();
+            let c = colour(r, g, b, 255);
+            fill_under(
+                target,
+                w,
+                h,
+                Hit {
+                    x0: (gx + mx * cell) as f32,
+                    y0: (gy + my * cell) as f32,
+                    x1: (gx + (mx + 1) * cell) as f32,
+                    y1: (gy + (my + 1) * cell) as f32,
+                },
+                c,
+            );
+        }
+    }
+
+    ResultButtons { save: Some(save), cancel: Some(cancel) }
+}

@@ -45,6 +45,17 @@ pub struct Cleaned {
     pub version: u32,
     pub ec_level: String,
     pub mask: i32,
+    /// Whether the source was light-on-dark and had to be inverted to be read.
+    ///
+    /// Carried through so the export can be written back in the polarity it was found in — a
+    /// white-on-black sign should be restored white-on-black.
+    pub source_inverted: bool,
+    /// The symbol exactly as it was sampled off the camera, row-major, `true` = dark.
+    ///
+    /// Kept so the result screen can show *what changed*: comparing this against the rebuild marks
+    /// every module barclean had to recover. Orientation-aligned with the reconstruction, including
+    /// through the mirrored retry — otherwise the whole grid would read as "changed".
+    pub sampled: Vec<bool>,
 }
 
 impl Cleaned {
@@ -103,7 +114,34 @@ impl core::fmt::Display for CleanError {
 }
 
 /// Detect and clean a QR symbol in a luminance image.
+///
+/// Tries the image as-is, then inverted. Plenty of real codes are printed light-on-dark — signage,
+/// dark packaging, screens in dark mode — and the binarizer marks the *background* as the dark
+/// modules there, so detection simply fails. rxing exposes an `AlsoInverted` hint but only on the
+/// multi-format reader, not on the bare detector this path uses, so the retry is done here.
 pub fn clean_luma(luma: &[u8], width: u32, height: u32) -> Result<Cleaned, CleanError> {
+    match clean_luma_oriented(luma, width, height) {
+        Ok(mut c) => {
+            c.source_inverted = false;
+            Ok(c)
+        }
+        Err(first) => {
+            let flipped: Vec<u8> = luma.iter().map(|v| 255 - v).collect();
+            match clean_luma_oriented(&flipped, width, height) {
+                Ok(mut c) => {
+                    c.source_inverted = true;
+                    Ok(c)
+                }
+                // Report the upright attempt's verdict: an inverted read of a non-inverted symbol
+                // fails in uninformative ways, and "how close was that" should describe the image
+                // as it actually is.
+                Err(_) => Err(first),
+            }
+        }
+    }
+}
+
+fn clean_luma_oriented(luma: &[u8], width: u32, height: u32) -> Result<Cleaned, CleanError> {
     let source = Luma8LuminanceSource::new(luma.to_vec(), width, height)
         .map_err(|_| CleanError::NotDetected)?;
     let bitmap = BinaryBitmap::new(HybridBinarizer::new(source));
@@ -148,10 +186,12 @@ pub fn clean_luma(luma: &[u8], width: u32, height: u32) -> Result<Cleaned, Clean
 /// "0 of 2 blocks recovered" on codes a stock reader handled without complaint.
 pub fn clean_bitmatrix(bits: BitMatrix) -> Result<Cleaned, CleanError> {
     let dimension = bits.getHeight() as usize;
+    let sampled = matrix_modules(&bits, dimension);
 
     let mut parser = BitMatrixParser::new(bits).map_err(|_| CleanError::Unreadable)?;
     let first = clean_with_parser(&mut parser, dimension);
-    if let Ok(cleaned) = first {
+    if let Ok(mut cleaned) = first {
+        cleaned.sampled = sampled;
         return Ok(cleaned);
     }
 
@@ -166,10 +206,35 @@ pub fn clean_bitmatrix(bits: BitMatrix) -> Result<Cleaned, CleanError> {
     parser.mirror();
 
     match clean_with_parser(&mut parser, dimension) {
-        Ok(cleaned) => Ok(cleaned),
+        Ok(mut cleaned) => {
+            // The mirrored read transposes the symbol, so the as-scanned matrix has to be
+            // transposed too or every module would compare as changed.
+            cleaned.sampled = transpose(&sampled, dimension);
+            Ok(cleaned)
+        }
         // Report whichever attempt got further, so the UI's "how close was that" is honest.
         Err(second) => Err(further_of(first.err(), second)),
     }
+}
+
+fn matrix_modules(bits: &BitMatrix, dimension: usize) -> Vec<bool> {
+    let mut out = Vec::with_capacity(dimension * dimension);
+    for y in 0..dimension {
+        for x in 0..dimension {
+            out.push(bits.get(x as u32, y as u32));
+        }
+    }
+    out
+}
+
+fn transpose(modules: &[bool], dimension: usize) -> Vec<bool> {
+    let mut out = vec![false; modules.len()];
+    for y in 0..dimension {
+        for x in 0..dimension {
+            out[x * dimension + y] = modules[y * dimension + x];
+        }
+    }
+    out
 }
 
 /// Pick the more informative of two failures — the one that decoded more blocks.
@@ -272,6 +337,10 @@ fn clean_with_parser(
         version: version.getVersionNumber(),
         ec_level: format!("{ec_level}"),
         mask,
+        // Both filled in by the caller, which knows whether the mirrored and inverted paths were
+        // taken.
+        source_inverted: false,
+        sampled: Vec::new(),
     })
 }
 

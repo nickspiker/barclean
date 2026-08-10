@@ -80,3 +80,74 @@ fn datamatrix_and_pdf417_are_read_by_the_fallback() {
         assert_eq!(stock.getText(), PAYLOAD, "{format:?} payload mismatch");
     }
 }
+
+/// A light-on-dark symbol must decode, and its export must come back in the same polarity.
+///
+/// Codes are printed inverted all the time — signage, dark packaging, dark-mode screens. The
+/// binarizer marks the *background* as dark in that case, so the detector finds nothing at all
+/// unless the image is retried inverted.
+#[test]
+fn inverted_source_decodes_and_round_trips_polarity() {
+    let (mut luma, w, h) = render_luma(BarcodeFormat::QR_CODE, PAYLOAD, 6);
+    for p in luma.iter_mut() {
+        *p = 255 - *p;
+    }
+
+    let cleaned = clean_luma(&luma, w, h).expect("a light-on-dark QR must still decode");
+    assert_eq!(cleaned.payload, PAYLOAD);
+    assert!(
+        cleaned.source_inverted,
+        "the inverted path decoded it, so it must be recorded as inverted"
+    );
+
+    // The export preserves polarity: restored in the form it was found in.
+    let rebuilt = cleaned.reconstruct().expect("reconstruct");
+    let png = barclean::render::to_png(&rebuilt, barclean::Symbology::QrCode, 8, cleaned.source_inverted)
+        .expect("encode");
+    let img = image::load_from_memory(&png).unwrap().to_luma8();
+    assert_eq!(
+        img.get_pixel(0, 0).0[0],
+        0,
+        "quiet zone should be dark for a light-on-dark restoration"
+    );
+
+    // And it round-trips through barclean's own reader.
+    //
+    // Verified through `clean_luma` rather than the stock decoder on purpose: stock rxing does not
+    // try an inverted read either, so it cannot scan this file. That is the cost of preserving
+    // polarity — the restoration matches the original in situ, but a reader without inversion
+    // support will not read it, exactly as it would not have read the original.
+    let (iw, ih) = img.dimensions();
+    let rescanned = clean_luma(&img.into_raw(), iw, ih).expect("inverted export must round-trip");
+    assert_eq!(rescanned.payload, PAYLOAD);
+    assert!(rescanned.source_inverted, "the export is light-on-dark");
+}
+
+/// The same symbol exported upright is readable by any stock decoder.
+///
+/// Together with the test above this pins the trade-off: upright exports are universally scannable,
+/// inverted ones match their original but need an inversion-aware reader.
+#[test]
+fn upright_export_is_readable_by_a_stock_decoder() {
+    let (mut luma, w, h) = render_luma(BarcodeFormat::QR_CODE, PAYLOAD, 6);
+    for p in luma.iter_mut() {
+        *p = 255 - *p;
+    }
+    let cleaned = clean_luma(&luma, w, h).expect("decode");
+    let rebuilt = cleaned.reconstruct().unwrap();
+
+    // Same recovered symbol, exported upright instead.
+    let png = barclean::render::to_png(&rebuilt, barclean::Symbology::QrCode, 8, false).unwrap();
+    let img = image::load_from_memory(&png).unwrap().to_luma8();
+    let (iw, ih) = img.dimensions();
+    let scanned = rxing::helpers::detect_in_luma(img.into_raw(), iw, ih, None)
+        .expect("an upright export must scan anywhere");
+    assert_eq!(scanned.getText(), PAYLOAD);
+}
+
+#[test]
+fn upright_sources_are_not_reported_as_inverted() {
+    let (luma, w, h) = render_luma(BarcodeFormat::QR_CODE, PAYLOAD, 6);
+    let cleaned = clean_luma(&luma, w, h).expect("decode");
+    assert!(!cleaned.source_inverted);
+}
