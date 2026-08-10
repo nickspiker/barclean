@@ -3,6 +3,7 @@ package com.barclean
 import android.Manifest
 import android.app.Activity
 import android.content.ContentValues
+import android.content.pm.ActivityInfo
 import android.content.pm.PackageManager
 import android.os.Environment
 import android.provider.MediaStore
@@ -123,6 +124,20 @@ class BarcleanActivity : Activity(), SurfaceHolder.Callback {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+
+        // Wide gamut, and ask the compositor to leave the pixels alone.
+        //
+        // fluor tags the buffer BT.2020 via ANativeWindow_setBuffersDataSpace, but that tag only
+        // survives if the Activity has opted into a wide-gamut surface — otherwise the compositor
+        // clamps to sRGB and the saturated primaries the result grid depends on arrive muted.
+        // preferMinimalPostProcessing (API 30+) additionally skips vendor "Vivid"-style saturation
+        // passes, which would fight the colours rather than help them.
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            window.colorMode = ActivityInfo.COLOR_MODE_WIDE_COLOR_GAMUT
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            window.attributes = window.attributes.also { it.preferMinimalPostProcessing = true }
+        }
 
         surfaceView = SurfaceView(this)
         // Load-bearing, and fatal to omit. fluor's Android present path locks the ANativeWindow and

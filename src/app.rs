@@ -85,8 +85,12 @@ impl ResultView {
             )
         } else if self.recovered > 0 {
             format!("{what} cleaned — {} modules repaired", self.recovered)
+        } else if self.fidelity == crate::clean::Fidelity::Exact {
+            format!("{what} — exact restoration, nothing needed repairing")
         } else {
-            format!("{what} — {}", self.fidelity.label())
+            // Say plainly that this is a re-encode and that no comparison was made, rather than
+            // letting a clean-looking grid imply one.
+            format!("{what} — re-encoded, not compared to the original")
         }
     }
 }
@@ -325,9 +329,9 @@ impl BarcleanApp {
                 .iter()
                 .map(|&dark| {
                     if dark {
-                        crate::render::ModuleVerdict::MatchedDark
+                        crate::render::ModuleVerdict::PlainDark
                     } else {
-                        crate::render::ModuleVerdict::MatchedLight
+                        crate::render::ModuleVerdict::PlainLight
                     }
                 })
                 .collect()

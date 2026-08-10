@@ -13,6 +13,15 @@ pub enum ModuleVerdict {
     RecoveredLight,
     /// Recovered, and the true value is dark.
     RecoveredDark,
+    /// No comparison was possible — shown as the plain symbol, light module.
+    ///
+    /// Exists so a restoration without a comparable original renders as *the symbol*, in black and
+    /// white, rather than borrowing the matched colours. Colouring it green and blue would claim
+    /// "the scan already had this right" when nothing was compared at all, which is a stronger
+    /// statement than any evidence supports.
+    PlainLight,
+    /// No comparison was possible — plain symbol, dark module.
+    PlainDark,
 }
 
 impl ModuleVerdict {
@@ -23,21 +32,28 @@ impl ModuleVerdict {
         )
     }
 
+    /// Whether this verdict carries a comparison at all.
+    pub fn compared(self) -> bool {
+        !matches!(self, ModuleVerdict::PlainLight | ModuleVerdict::PlainDark)
+    }
+
     /// Display colour as `(r, g, b)`.
     ///
-    /// Green/blue for modules the scan already had right, yellow/red for ones barclean had to
-    /// recover — so the logo's footprint appears as a solid yellow-and-red patch against a
-    /// green-and-blue field, and the amount of work done is legible at a glance.
+    /// Full-saturation primaries, deliberately. This is a diagnostic read at arm's length while
+    /// holding a phone, and a muted palette makes the recovered patch blend into the matched field
+    /// — which is the one distinction the view exists to draw.
     ///
-    /// Within each pair the *lighter* colour marks a light module: green and yellow are white
-    /// modules, blue and red are black ones. Keeping brightness aligned with the module's actual
-    /// value means the grid still reads as the symbol rather than as its photographic negative.
+    /// Green/blue for modules the scan already had right, yellow/red for ones barclean recovered.
+    /// Within each pair the *lighter* colour marks a light module, so the grid still reads as the
+    /// symbol rather than as its photographic negative.
     pub fn rgb(self) -> (u8, u8, u8) {
         match self {
-            ModuleVerdict::MatchedLight => (40, 190, 90),
-            ModuleVerdict::MatchedDark => (40, 110, 230),
-            ModuleVerdict::RecoveredLight => (240, 205, 40),
-            ModuleVerdict::RecoveredDark => (225, 60, 50),
+            ModuleVerdict::MatchedLight => (0, 255, 0),
+            ModuleVerdict::MatchedDark => (0, 0, 255),
+            ModuleVerdict::RecoveredLight => (255, 255, 0),
+            ModuleVerdict::RecoveredDark => (255, 0, 0),
+            ModuleVerdict::PlainLight => (255, 255, 255),
+            ModuleVerdict::PlainDark => (0, 0, 0),
         }
     }
 }
@@ -213,6 +229,8 @@ mod tests {
             ModuleVerdict::MatchedDark,
             ModuleVerdict::RecoveredLight,
             ModuleVerdict::RecoveredDark,
+            ModuleVerdict::PlainLight,
+            ModuleVerdict::PlainDark,
         ]
         .iter()
         .map(|v| v.rgb())
@@ -293,5 +311,38 @@ mod tests {
         };
         assert!(luma(ModuleVerdict::MatchedLight) > luma(ModuleVerdict::MatchedDark));
         assert!(luma(ModuleVerdict::RecoveredLight) > luma(ModuleVerdict::RecoveredDark));
+    }
+
+    #[test]
+    fn plain_verdicts_carry_no_claim_of_comparison() {
+        // Rendering an uncompared restoration in the matched colours would assert "the scan already
+        // had this right" on evidence that does not exist.
+        assert!(!ModuleVerdict::PlainLight.compared());
+        assert!(!ModuleVerdict::PlainDark.compared());
+        assert!(ModuleVerdict::MatchedLight.compared());
+        assert!(ModuleVerdict::RecoveredDark.compared());
+
+        // And they render as the symbol itself, black on white.
+        assert_eq!(ModuleVerdict::PlainLight.rgb(), (255, 255, 255));
+        assert_eq!(ModuleVerdict::PlainDark.rgb(), (0, 0, 0));
+    }
+
+    #[test]
+    fn comparison_colours_are_fully_saturated_primaries() {
+        // Muted colours let the recovered patch blend into the matched field, which is the one
+        // distinction this view exists to draw.
+        for v in [
+            ModuleVerdict::MatchedLight,
+            ModuleVerdict::MatchedDark,
+            ModuleVerdict::RecoveredLight,
+            ModuleVerdict::RecoveredDark,
+        ] {
+            let (r, g, b) = v.rgb();
+            assert!(
+                [r, g, b].iter().all(|&c| c == 0 || c == 255),
+                "{v:?} is not a primary: {:?}",
+                v.rgb()
+            );
+        }
     }
 }
