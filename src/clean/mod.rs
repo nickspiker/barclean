@@ -28,10 +28,12 @@
 //! *damaged*, worst first, capped hard, with room optionally held back for the
 //! errors we did not see coming.
 
+pub mod any;
 pub mod bootstrap;
 pub mod erasure;
 pub mod qr;
 
+pub use any::{CleanedAny, Fidelity, clean};
 pub use bootstrap::{BootstrapOutcome, BootstrapParams, bootstrap};
 pub use erasure::{BlockLayout, CodewordProvenance, ErasurePlan};
 pub use qr::{CleanError, Cleaned, clean_bitmatrix, clean_luma};

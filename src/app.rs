@@ -38,13 +38,10 @@ pub enum DecodeState {
     },
     /// Located and read, but too damaged to recover.
     TooDamaged { decoded: usize, total: usize },
-    /// Read by the stock decoder in a format barclean does not clean yet.
+    /// Cleaned, but re-encoded rather than rebuilt bit-exactly.
     ///
-    /// Aztec, PDF417 and DataMatrix currently fall here: they share the erasure-aware Reed-Solomon
-    /// layer but not the QR-specific bootstrap path. Reporting them honestly beats showing nothing,
-    /// and it separates "detection works, cleaning is not wired" from "nothing works at all" —
-    /// which is otherwise indistinguishable from behind the viewfinder.
-    Uncleaned { payload: String, format: String },
+    /// Aztec, DataMatrix and PDF417 land here — see `clean::any` for why the grade differs.
+    Reencoded { payload: String, format: String },
 }
 
 impl DecodeState {
@@ -52,7 +49,7 @@ impl DecodeState {
         match self {
             DecodeState::Decoded(p)
             | DecodeState::Recovered { payload: p, .. }
-            | DecodeState::Uncleaned { payload: p, .. } => Some(p),
+            | DecodeState::Reencoded { payload: p, .. } => Some(p),
             _ => None,
         }
     }
@@ -67,9 +64,12 @@ pub struct ResultView {
     pub payload: String,
     /// Source was light-on-dark; the export preserves that.
     pub inverted: bool,
+    pub symbology: crate::Symbology,
+    pub fidelity: crate::clean::Fidelity,
     pub rebuilt: Reconstructed,
     pub verdicts: Vec<ModuleVerdict>,
     pub dimension: usize,
+    pub height: usize,
     pub recovered: usize,
     pub blocks_rescued: usize,
     pub blocks_total: usize,
@@ -77,15 +77,16 @@ pub struct ResultView {
 
 impl ResultView {
     fn headline(&self) -> String {
+        let what = self.symbology.name();
         if self.blocks_rescued > 0 {
             format!(
-                "Recovered — {} of {} blocks rescued, {} modules repaired",
+                "{what} recovered — {} of {} blocks rescued, {} modules repaired",
                 self.blocks_rescued, self.blocks_total, self.recovered
             )
         } else if self.recovered > 0 {
-            format!("Cleaned — {} modules repaired", self.recovered)
+            format!("{what} cleaned — {} modules repaired", self.recovered)
         } else {
-            "Clean — nothing needed repairing".to_string()
+            format!("{what} — {}", self.fidelity.label())
         }
     }
 }
@@ -189,8 +190,8 @@ impl BarcleanApp {
             DecodeState::TooDamaged { decoded, total } => {
                 format!("too damaged: {decoded}/{total} blocks")
             }
-            DecodeState::Uncleaned { payload, format } => {
-                format!("{format} (uncleaned): {payload}")
+            DecodeState::Reencoded { payload, format } => {
+                format!("{format} re-encoded: {payload}")
             }
         }
     }
@@ -265,26 +266,27 @@ impl BarcleanApp {
 
         self.state = match outcome.result {
             Ok(c) => {
-                self.last_symbol = Some((c.dimension, c.px_per_module));
-                let (rescued, total) = (c.blocks_rescued(), c.blocks_total);
+                if c.px_per_module > 0.0 {
+                    self.last_symbol = Some((c.rebuilt.dimension, c.px_per_module));
+                }
+                let (rescued, total) = (c.blocks_rescued, c.blocks_total);
                 let payload = c.payload.clone();
+                let exact = c.fidelity == crate::clean::Fidelity::Exact;
+                let name = c.symbology.name().to_string();
                 // Freeze on any successful decode, not only a rescued one: a logo-branded code that
                 // reads fine still carries a logo the user wants gone, and the pristine rebuild is
                 // what they came for either way.
                 self.freeze(c);
-                if rescued > 0 {
-                    DecodeState::Recovered { payload, rescued, total }
-                } else {
-                    DecodeState::Decoded(payload)
+                match (exact, rescued > 0) {
+                    (_, true) => DecodeState::Recovered { payload, rescued, total },
+                    (true, false) => DecodeState::Decoded(payload),
+                    (false, false) => DecodeState::Reencoded { payload, format: name },
                 }
             }
             Err(crate::clean::CleanError::Unrecoverable { blocks_total, blocks_decoded }) => {
                 DecodeState::TooDamaged { decoded: blocks_decoded, total: blocks_total }
             }
-            Err(_) => match outcome.fallback {
-                Some((payload, format)) => DecodeState::Uncleaned { payload, format },
-                None => DecodeState::Searching,
-            },
+            Err(_) => DecodeState::Searching,
         };
         self.pending_frame = true;
 
@@ -304,23 +306,45 @@ impl BarcleanApp {
     }
 
     /// Freeze a successful clean into the result screen.
-    fn freeze(&mut self, cleaned: crate::clean::Cleaned) {
-        let Ok(rebuilt) = cleaned.reconstruct() else {
-            return;
-        };
-        let Some(verdicts) = crate::render::compare(&rebuilt, &cleaned.sampled) else {
-            return;
-        };
-        let recovered = verdicts.iter().filter(|v| v.recovered()).count();
+    fn freeze(&mut self, cleaned: crate::clean::CleanedAny) {
+        // A comparison only exists where the sampled matrix aligns with the rebuild, which is the
+        // exact path. For a re-encode the symbol may not even be the same size, so the grid shows
+        // the restoration plainly rather than inventing a diff against a different symbol.
+        let verdicts = cleaned
+            .sampled
+            .as_ref()
+            .and_then(|s| crate::render::compare(&cleaned.rebuilt, s));
+        let recovered = verdicts
+            .as_ref()
+            .map(|v| v.iter().filter(|v| v.recovered()).count())
+            .unwrap_or(0);
+        let verdicts = verdicts.unwrap_or_else(|| {
+            cleaned
+                .rebuilt
+                .modules()
+                .iter()
+                .map(|&dark| {
+                    if dark {
+                        crate::render::ModuleVerdict::MatchedDark
+                    } else {
+                        crate::render::ModuleVerdict::MatchedLight
+                    }
+                })
+                .collect()
+        });
+
         self.feed.set_frozen(true);
         self.screen = Screen::Result(Box::new(ResultView {
             inverted: cleaned.source_inverted,
             payload: cleaned.payload,
-            dimension: rebuilt.dimension,
-            rebuilt,
+            symbology: cleaned.symbology,
+            fidelity: cleaned.fidelity,
+            dimension: cleaned.rebuilt.dimension,
+            height: cleaned.rebuilt.height(),
+            rebuilt: cleaned.rebuilt,
             verdicts,
             recovered,
-            blocks_rescued: cleaned.blocks_total - cleaned.blocks_decoded_initially,
+            blocks_rescued: cleaned.blocks_rescued,
             blocks_total: cleaned.blocks_total,
         }));
         self.pending_frame = true;
@@ -418,9 +442,9 @@ impl BarcleanApp {
                 format!("too damaged — {decoded}/{total} blocks"),
                 None,
             ),
-            DecodeState::Uncleaned { payload, format } => (
+            DecodeState::Reencoded { payload, format } => (
                 colour(150, 90, 200, 255),
-                format!("{format} (cleaning not wired)"),
+                format!("{format} — re-encoded"),
                 Some(payload.clone()),
             ),
         }
@@ -468,7 +492,7 @@ impl FluorApp for BarcleanApp {
                         // symbol-sized image and the alternative is threading a result back.
                         match crate::render::to_png(
                             &view.rebuilt,
-                            crate::Symbology::QrCode,
+                            view.symbology,
                             12,
                             view.inverted,
                         ) {
@@ -528,9 +552,10 @@ impl FluorApp for BarcleanApp {
 
         if let Screen::Result(view) = &self.screen {
             let (headline, payload) = (view.headline(), view.payload.clone());
-            let (dimension, verdicts) = (view.dimension, view.verdicts.clone());
+            let (dimension, height) = (view.dimension, view.height);
+            let verdicts = view.verdicts.clone();
             self.result_buttons =
-                ui::draw_result(target, ctx, dimension, &verdicts, &headline, &payload);
+                ui::draw_result(target, ctx, dimension, height, &verdicts, &headline, &payload);
             let ground = colour(10, 10, 12, 255);
             for px in target.iter_mut().take(w * h) {
                 *px = (*px).under(ground, BlendMode::Normal);
@@ -654,7 +679,7 @@ mod tests {
             DecodeState::Decoded("x".into()),
             DecodeState::Recovered { payload: "x".into(), rescued: 2, total: 8 },
             DecodeState::TooDamaged { decoded: 1, total: 8 },
-            DecodeState::Uncleaned { payload: "x".into(), format: "AZTEC".into() },
+            DecodeState::Reencoded { payload: "x".into(), format: "Aztec".into() },
         ] {
             app.state = state;
             let line = app.status_line();
@@ -672,7 +697,7 @@ mod tests {
             Some("b")
         );
         assert_eq!(
-            DecodeState::Uncleaned { payload: "c".into(), format: "AZTEC".into() }.payload(),
+            DecodeState::Reencoded { payload: "c".into(), format: "Aztec".into() }.payload(),
             Some("c")
         );
         assert_eq!(DecodeState::Searching.payload(), None);

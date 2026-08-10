@@ -343,17 +343,19 @@ pub struct ResultButtons {
 /// yellow are ones barclean recovered. A logo's footprint shows up as a solid red-and-yellow patch,
 /// so the claim "this was reconstructed" is something you can see rather than something you have to
 /// take on faith.
+#[allow(clippy::too_many_arguments)]
 pub fn draw_result(
     target: &mut [u32],
     ctx: &mut Context,
     dimension: usize,
+    rows: usize,
     verdicts: &[crate::render::ModuleVerdict],
     headline: &str,
     payload: &str,
 ) -> ResultButtons {
     let w = ctx.viewport.width_px as usize;
     let h = ctx.viewport.height_px as usize;
-    if w == 0 || h == 0 || dimension == 0 || verdicts.len() != dimension * dimension {
+    if w == 0 || h == 0 || dimension == 0 || rows == 0 || verdicts.len() != dimension * rows {
         return ResultButtons::default();
     }
     let span = ctx.viewport.effective_span();
@@ -422,12 +424,16 @@ pub fn draw_result(
     let top = head_y + span * 0.07;
     let avail_h = (bar_y - top).max(0.0);
     let avail_w = w as f32 * 0.92;
-    let cell = (avail_w.min(avail_h) / dimension as f32).floor().max(1.0) as usize;
-    let grid_px = cell * dimension;
-    let gx = (w.saturating_sub(grid_px)) / 2;
-    let gy = top as usize + ((avail_h as usize).saturating_sub(grid_px)) / 2;
+    // PDF417 is wide and short, so the cell size is bounded by both axes independently.
+    let cell = (avail_w / dimension as f32)
+        .min(avail_h / rows as f32)
+        .floor()
+        .max(1.0) as usize;
+    let (grid_w, grid_h) = (cell * dimension, cell * rows);
+    let gx = (w.saturating_sub(grid_w)) / 2;
+    let gy = top as usize + ((avail_h as usize).saturating_sub(grid_h)) / 2;
 
-    for my in 0..dimension {
+    for my in 0..rows {
         for mx in 0..dimension {
             let (r, g, b) = verdicts[my * dimension + mx].rgb();
             let c = colour(r, g, b, 255);

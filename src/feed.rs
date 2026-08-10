@@ -77,9 +77,7 @@ impl Frame {
 
 /// What a decode attempt concluded, with the frame it ran on.
 pub struct Decoded {
-    pub result: Result<crate::clean::Cleaned, crate::clean::CleanError>,
-    /// Stock multi-format fallback, when the cleaner declined and something else read it.
-    pub fallback: Option<(String, String)>,
+    pub result: Result<crate::clean::CleanedAny, crate::clean::CleanError>,
     pub elapsed_ms: u32,
 }
 
@@ -236,19 +234,7 @@ pub fn spawn_worker(feed: Arc<CameraFeed>) -> std::thread::JoinHandle<()> {
                 }
                 let started = std::time::Instant::now();
                 let result =
-                    crate::clean::clean_luma(&frame.luma, frame.width as u32, frame.height as u32);
-                let fallback = if result.is_err() {
-                    rxing::helpers::detect_in_luma(
-                        frame.luma.clone(),
-                        frame.width as u32,
-                        frame.height as u32,
-                        None,
-                    )
-                    .ok()
-                    .map(|r| (r.getText().to_string(), format!("{:?}", r.getBarcodeFormat())))
-                } else {
-                    None
-                };
+                    crate::clean::clean(&frame.luma, frame.width as u32, frame.height as u32);
                 let elapsed_ms = started.elapsed().as_millis() as u32;
 
                 // Drop the result if the app froze while this was running — the user is looking at
@@ -256,11 +242,7 @@ pub fn spawn_worker(feed: Arc<CameraFeed>) -> std::thread::JoinHandle<()> {
                 if feed.is_frozen() {
                     continue;
                 }
-                *feed.outcome.lock().unwrap() = Some(Decoded {
-                    result,
-                    fallback,
-                    elapsed_ms,
-                });
+                *feed.outcome.lock().unwrap() = Some(Decoded { result, elapsed_ms });
             }
         })
         .expect("spawn decode worker")
@@ -346,7 +328,6 @@ mod tests {
         let feed = feed_with_frame();
         *feed.outcome.lock().unwrap() = Some(Decoded {
             result: Err(crate::clean::CleanError::NotDetected),
-            fallback: None,
             elapsed_ms: 1,
         });
         feed.set_frozen(true);

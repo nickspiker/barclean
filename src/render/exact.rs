@@ -26,11 +26,34 @@ use rxing::qrcode::encoder::matrix_util;
 /// A rebuilt symbol: `true` is a dark module, row-major.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Reconstructed {
+    /// Width in modules. Named `dimension` because QR symbols are square and everything downstream
+    /// grew up assuming that; PDF417 is the exception that made `height` necessary.
     pub dimension: usize,
+    height: usize,
     modules: Vec<bool>,
 }
 
 impl Reconstructed {
+    /// Wrap an already-built module grid.
+    ///
+    /// For symbologies rebuilt through their encoder rather than from codewords. `width` and
+    /// `height` are separate because PDF417 is emphatically not square.
+    pub fn from_modules(width: usize, height: usize, modules: Vec<bool>) -> Option<Self> {
+        (modules.len() == width * height).then_some(Self {
+            dimension: width,
+            height,
+            modules,
+        })
+    }
+
+    pub fn width(&self) -> usize {
+        self.dimension
+    }
+
+    pub fn height(&self) -> usize {
+        self.height
+    }
+
     pub fn get(&self, x: usize, y: usize) -> bool {
         self.modules[y * self.dimension + x]
     }
@@ -58,9 +81,10 @@ impl Reconstructed {
     /// The quiet zone is not decoration — a detector needs it to find the symbol at all, and a
     /// "cleaned" export without one would be less scannable than the damaged original.
     pub fn to_luma(&self, scale: usize, quiet_zone: usize) -> (Vec<u8>, usize, usize) {
-        let side = (self.dimension + 2 * quiet_zone) * scale;
-        let mut out = vec![255u8; side * side];
-        for my in 0..self.dimension {
+        let w = (self.dimension + 2 * quiet_zone) * scale;
+        let h = (self.height + 2 * quiet_zone) * scale;
+        let mut out = vec![255u8; w * h];
+        for my in 0..self.height {
             for mx in 0..self.dimension {
                 if !self.get(mx, my) {
                     continue;
@@ -69,12 +93,12 @@ impl Reconstructed {
                     for dx in 0..scale {
                         let x = (mx + quiet_zone) * scale + dx;
                         let y = (my + quiet_zone) * scale + dy;
-                        out[y * side + x] = 0;
+                        out[y * w + x] = 0;
                     }
                 }
             }
         }
-        (out, side, side)
+        (out, w, h)
     }
 }
 
@@ -117,7 +141,11 @@ pub fn from_codewords(
         }
     }
 
-    Ok(Reconstructed { dimension, modules })
+    Ok(Reconstructed {
+        dimension,
+        height: dimension,
+        modules,
+    })
 }
 
 #[cfg(test)]
