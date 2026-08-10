@@ -11,10 +11,13 @@
 //! each came from, corrected, and written back where they came from. It gets no bootstrap loop,
 //! because it carries a single Reed-Solomon block and there are no survivors to bootstrap from.
 //!
-//! **DataMatrix and PDF417** are still re-encoded from the recovered payload and verified. Doing
-//! for them what Aztec now has means instrumenting each one's own placement walk — DataMatrix's
-//! ECC200 placement and PDF417's row structure — which is real work per format and independent of
-//! the recovery itself.
+//! **DataMatrix** gets both: an exact rebuild by the same write-back route, plus the bootstrap loop
+//! on symbols large enough to interleave their blocks. Smaller ones carry a single block and behave
+//! like Aztec.
+//!
+//! **PDF417** is still re-encoded from the recovered payload and verified. Giving it what the others
+//! have means instrumenting its row structure, which is real work independent of the recovery
+//! itself.
 //!
 //! What all four *do* get is the thing this is for: photograph a damaged code — folded, smudged,
 //! scuffed, printed badly — and get back a clean one. Ordinary Reed-Solomon already recovers the
@@ -139,6 +142,31 @@ pub fn clean(luma: &[u8], width: u32, height: u32) -> Result<CleanedAny, CleanEr
         }
     }
 
+    // DataMatrix: exact rebuild, and the bootstrap loop where the symbol is large enough to
+    // interleave its blocks.
+    for (candidate, inverted) in [(luma.to_vec(), false)]
+        .into_iter()
+        .chain(std::iter::once((
+            luma.iter().map(|v| 255 - v).collect::<Vec<u8>>(),
+            true,
+        )))
+    {
+        if let Ok(dm) = crate::clean::datamatrix::clean_luma(&candidate, width, height) {
+            let rescued = dm.blocks_rescued();
+            return Ok(CleanedAny {
+                symbology: Symbology::DataMatrix,
+                payload: dm.payload,
+                fidelity: Fidelity::Exact,
+                sampled: Some(dm.sampled),
+                rebuilt: dm.rebuilt,
+                blocks_rescued: rescued,
+                blocks_total: dm.blocks_total,
+                source_inverted: inverted,
+                px_per_module: 0.0,
+            });
+        }
+    }
+
     // Everything else, upright then inverted — light-on-dark codes are common and the binarizer
     // marks the background as the dark modules, so they are simply invisible otherwise.
     let (result, inverted) = match rxing::helpers::detect_in_luma(luma.to_vec(), width, height, None)
@@ -250,8 +278,8 @@ mod tests {
             assert!(!cleaned.source_inverted);
 
             let expected = match symbology {
-                Symbology::QrCode | Symbology::Aztec => Fidelity::Exact,
-                _ => Fidelity::Reencoded,
+                Symbology::Pdf417 => Fidelity::Reencoded,
+                _ => Fidelity::Exact,
             };
             assert_eq!(cleaned.fidelity, expected, "{}", symbology.name());
         }
@@ -299,14 +327,14 @@ mod tests {
             let (luma, w, h) = render_luma(symbology, PAYLOAD, 8);
             let cleaned = clean(&luma, w, h).unwrap();
             match symbology {
-                Symbology::QrCode | Symbology::Aztec => {
+                Symbology::Pdf417 => assert!(cleaned.sampled.is_none(), "{}", symbology.name()),
+                _ => {
                     let sampled = cleaned
                         .sampled
                         .as_ref()
                         .unwrap_or_else(|| panic!("{} must carry its sampled matrix", symbology.name()));
                     assert_eq!(sampled.len(), cleaned.rebuilt.modules().len());
                 }
-                _ => assert!(cleaned.sampled.is_none(), "{}", symbology.name()),
             }
         }
     }

@@ -31,6 +31,7 @@
 pub mod any;
 pub mod aztec;
 pub mod bootstrap;
+pub mod datamatrix;
 pub mod erasure;
 pub mod qr;
 
