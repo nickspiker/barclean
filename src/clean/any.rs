@@ -7,14 +7,14 @@
 //! its Reed-Solomon blocks: a contiguous occlusion is spread across every block, so surviving blocks
 //! can localize the damage for the failed ones.
 //!
-//! **Aztec, DataMatrix and PDF417** are re-encoded from the recovered payload and verified. The
-//! difference is not laziness, it is structural:
+//! **Aztec** is also rebuilt exactly, by a different route: its bits are read along with the module
+//! each came from, corrected, and written back where they came from. It gets no bootstrap loop,
+//! because it carries a single Reed-Solomon block and there are no survivors to bootstrap from.
 //!
-//! - Aztec and PDF417 carry a **single** Reed-Solomon block. There are no survivors to bootstrap
-//!   from — the symbol either decodes or it does not — so the loop has nothing to work with.
-//! - Rebuilding them at codeword level needs each format's own placement algorithm written in
-//!   reverse (Aztec's spiral, DataMatrix's ECC200 placement, PDF417's row indicators), which is
-//!   real work per format and independent of the recovery itself.
+//! **DataMatrix and PDF417** are still re-encoded from the recovered payload and verified. Doing
+//! for them what Aztec now has means instrumenting each one's own placement walk — DataMatrix's
+//! ECC200 placement and PDF417's row structure — which is real work per format and independent of
+//! the recovery itself.
 //!
 //! What all four *do* get is the thing this is for: photograph a damaged code — folded, smudged,
 //! scuffed, printed badly — and get back a clean one. Ordinary Reed-Solomon already recovers the
@@ -111,6 +111,32 @@ pub fn clean(luma: &[u8], width: u32, height: u32) -> Result<CleanedAny, CleanEr
             source_inverted: qr.source_inverted,
             px_per_module: qr.px_per_module,
         });
+    }
+
+    // Aztec next: no bootstrap loop (single Reed-Solomon block, nothing to bootstrap from) but a
+    // fully exact rebuild, by writing corrected bits back into the modules they were read from.
+    for (luma, inverted) in [(luma.to_vec(), false)]
+        .into_iter()
+        .chain(std::iter::once((
+            luma.iter().map(|v| 255 - v).collect::<Vec<u8>>(),
+            true,
+        )))
+    {
+        if let Ok(az) = crate::clean::aztec::clean_luma(&luma, width, height) {
+            return Ok(CleanedAny {
+                symbology: Symbology::Aztec,
+                payload: az.payload,
+                fidelity: Fidelity::Exact,
+                sampled: Some(az.sampled),
+                rebuilt: az.rebuilt,
+                // One block: it decoded, so nothing was "rescued" in the bootstrap sense. The
+                // repaired-module count in the comparison grid is the honest measure of work done.
+                blocks_rescued: 0,
+                blocks_total: 1,
+                source_inverted: inverted,
+                px_per_module: 0.0,
+            });
+        }
     }
 
     // Everything else, upright then inverted — light-on-dark codes are common and the binarizer
@@ -223,10 +249,9 @@ mod tests {
             assert_eq!(cleaned.payload, PAYLOAD, "{}: payload mismatch", symbology.name());
             assert!(!cleaned.source_inverted);
 
-            let expected = if symbology == Symbology::QrCode {
-                Fidelity::Exact
-            } else {
-                Fidelity::Reencoded
+            let expected = match symbology {
+                Symbology::QrCode | Symbology::Aztec => Fidelity::Exact,
+                _ => Fidelity::Reencoded,
             };
             assert_eq!(cleaned.fidelity, expected, "{}", symbology.name());
         }
@@ -267,17 +292,21 @@ mod tests {
     }
 
     #[test]
-    fn only_qr_carries_a_comparable_sampled_matrix() {
+    fn only_exact_restorations_carry_a_comparable_sampled_matrix() {
         // A re-encode may not even be the same size as the original, so offering a module-by-module
         // comparison for it would be noise presented as evidence.
         for symbology in Symbology::ALL {
             let (luma, w, h) = render_luma(symbology, PAYLOAD, 8);
             let cleaned = clean(&luma, w, h).unwrap();
-            if symbology == Symbology::QrCode {
-                let sampled = cleaned.sampled.as_ref().expect("QR must carry its sampled matrix");
-                assert_eq!(sampled.len(), cleaned.rebuilt.modules().len());
-            } else {
-                assert!(cleaned.sampled.is_none(), "{}", symbology.name());
+            match symbology {
+                Symbology::QrCode | Symbology::Aztec => {
+                    let sampled = cleaned
+                        .sampled
+                        .as_ref()
+                        .unwrap_or_else(|| panic!("{} must carry its sampled matrix", symbology.name()));
+                    assert_eq!(sampled.len(), cleaned.rebuilt.modules().len());
+                }
+                _ => assert!(cleaned.sampled.is_none(), "{}", symbology.name()),
             }
         }
     }

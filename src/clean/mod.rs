@@ -29,6 +29,7 @@
 //! errors we did not see coming.
 
 pub mod any;
+pub mod aztec;
 pub mod bootstrap;
 pub mod erasure;
 pub mod qr;
