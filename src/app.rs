@@ -13,56 +13,12 @@ use fluor::host::event_response::EventResponse;
 use fluor::pixel::{Blend, BlendMode};
 use fluor::Viewport;
 
+use std::sync::Arc;
+
 use crate::camera::{LensPicker, LensSpec, PickerParams};
+use crate::feed::{CameraFeed, Frame};
 use crate::render::{ModuleVerdict, Reconstructed};
 use crate::ui::{self, LensButtons, ResultButtons, colour};
-
-/// The most recent camera frame's luminance plane.
-#[derive(Clone, Default)]
-struct Frame {
-    luma: Vec<u8>,
-    width: usize,
-    height: usize,
-    /// Clockwise rotation needed to bring the sensor's output upright on this display, from
-    /// `SENSOR_ORIENTATION`. Phone sensors are mounted landscape, so this is 90 on essentially
-    /// every device held in portrait.
-    rotation: u32,
-}
-
-impl Frame {
-    fn is_empty(&self) -> bool {
-        self.width == 0 || self.height == 0 || self.luma.is_empty()
-    }
-
-    /// Dimensions after rotation — swapped on the quarter turns.
-    fn rotated_dims(&self) -> (usize, usize) {
-        match self.rotation {
-            90 | 270 => (self.height, self.width),
-            _ => (self.width, self.height),
-        }
-    }
-
-    /// Sample the upright image at `(x, y)`, mapping back through the rotation.
-    ///
-    /// Rotating at sample time rather than rotating the buffer keeps the decoder working on the
-    /// sensor's own pixels: a rotation would either cost a full copy every frame or resample and
-    /// blur module edges, and module edges are the entire signal here.
-    fn sample_upright(&self, x: usize, y: usize) -> u8 {
-        let (ox, oy) = match self.rotation {
-            90 => (y, self.height.saturating_sub(1).saturating_sub(x)),
-            180 => (
-                self.width.saturating_sub(1).saturating_sub(x),
-                self.height.saturating_sub(1).saturating_sub(y),
-            ),
-            270 => (self.width.saturating_sub(1).saturating_sub(y), x),
-            _ => (x, y),
-        };
-        if ox >= self.width || oy >= self.height {
-            return 0;
-        }
-        self.luma[oy * self.width + ox]
-    }
-}
 
 /// What the last decode attempt concluded.
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
@@ -143,11 +99,13 @@ pub enum Screen {
 }
 
 pub struct BarcleanApp {
-    frame: Frame,
+    /// Shared with the camera and decode threads. The app only ever *reads* snapshots from it, so
+    /// nothing here can be caught half-updated.
+    feed: Arc<CameraFeed>,
+    /// The frame currently being drawn, held for the duration of a render so the preview cannot
+    /// change under the blit.
+    frame: Option<Arc<Frame>>,
     state: DecodeState,
-    /// Frames received since launch. The first thing to check when the screen is blank: if this is
-    /// not climbing, the problem is the camera pipeline, not the renderer.
-    frames: u64,
     /// A frame has arrived that has not been drawn yet.
     ///
     /// fluor only repaints when the window is marked dirty, and the default `tick` returns `false`,
@@ -155,6 +113,8 @@ pub struct BarcleanApp {
     /// frame per touch and looks frozen otherwise. A camera app is the case where new content
     /// arrives with no user input at all, so it has to raise its own hand.
     pending_frame: bool,
+    /// Frame number at the last diagnostic log line.
+    last_logged_frame: u64,
     /// Wall time of the last decode attempt. A full clean at preview resolution is not free, and if
     /// it exceeds the frame interval the pipeline is running behind rather than failing.
     last_decode_ms: u32,
@@ -177,20 +137,15 @@ pub struct BarcleanApp {
     viewport: Viewport,
 }
 
-impl Default for BarcleanApp {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl BarcleanApp {
-    pub fn new() -> Self {
+    pub fn new(feed: Arc<CameraFeed>) -> Self {
         Self {
-            frame: Frame::default(),
+            feed,
+            frame: None,
             state: DecodeState::NoFrames,
-            frames: 0,
             pending_frame: false,
             last_decode_ms: 0,
+            last_logged_frame: 0,
             last_symbol: None,
             picker: LensPicker::new(Vec::new(), PickerParams::default()),
             current_lens: String::new(),
@@ -208,7 +163,11 @@ impl BarcleanApp {
     }
 
     pub fn frames(&self) -> u64 {
-        self.frames
+        self.feed.frames()
+    }
+
+    pub fn feed(&self) -> &Arc<CameraFeed> {
+        &self.feed
     }
 
     /// One-line diagnostic for logcat and, shortly, the on-screen status text.
@@ -217,7 +176,9 @@ impl BarcleanApp {
             DecodeState::NoFrames => "no frames".to_string(),
             DecodeState::Searching => format!(
                 "searching  {}x{}  rot{}",
-                self.frame.width, self.frame.height, self.frame.rotation
+                self.frame.as_ref().map_or(0, |f| f.width),
+                self.frame.as_ref().map_or(0, |f| f.height),
+                self.frame.as_ref().map_or(0, |f| f.rotation)
             ),
             DecodeState::Decoded(p) => format!("decoded: {p}"),
             DecodeState::Recovered {
@@ -290,103 +251,56 @@ impl BarcleanApp {
         }
     }
 
-    /// Accept one camera frame's luminance plane.
+    /// Collect whatever the decode worker has produced since the last frame.
     ///
-    /// `row_stride` is not necessarily `width` — Camera2 pads rows to a hardware alignment, and
-    /// treating stride as width shears the image progressively down the frame. The rows are
-    /// compacted here so everything downstream can assume a tight buffer.
-    pub fn on_camera_frame(
-        &mut self,
-        luma: &[u8],
-        width: usize,
-        height: usize,
-        row_stride: usize,
-        rotation: u32,
-    ) {
-        if width == 0 || height == 0 {
-            return;
-        }
-        let stride = if row_stride >= width { row_stride } else { width };
+    /// Called from the render thread, which is the only thread that mutates app state — the camera
+    /// and decode threads communicate exclusively through [`CameraFeed`] snapshots.
+    fn collect(&mut self) {
+        self.frame = self.feed.latest();
 
-        let mut tight = Vec::with_capacity(width * height);
-        for y in 0..height {
-            let start = y * stride;
-            let end = start + width;
-            if end > luma.len() {
-                break;
-            }
-            tight.extend_from_slice(&luma[start..end]);
-        }
-        if tight.len() < width * height {
+        let Some(outcome) = self.feed.take_outcome() else {
             return;
-        }
-
-        self.frame = Frame {
-            luma: tight,
-            width,
-            height,
-            rotation: rotation % 360,
         };
-        self.frames += 1;
-        self.pending_frame = true;
+        self.last_decode_ms = outcome.elapsed_ms;
 
-        let started = std::time::Instant::now();
-        self.decode();
-        self.last_decode_ms = started.elapsed().as_millis() as u32;
-    }
-
-    /// Run the full cleaning path on the current frame.
-    ///
-    /// This is barclean's actual pipeline, not a stock decode: detection, provenance-recording
-    /// codeword extraction, then the bootstrap loop. On an undamaged symbol it costs one extra
-    /// Reed-Solomon pass over a plain decode, and on a damaged one it is the difference between a
-    /// payload and nothing.
-    ///
-    /// Note it runs on the *unrotated* sensor buffer. The detector finds symbols at any orientation
-    /// — that is what the perspective transform is for — so rotating first would cost a full copy
-    /// per frame and resample module edges, which are the entire signal.
-    fn decode(&mut self) {
-        // Frozen on a result: frames keep arriving so the preview is warm when the user returns,
-        // but nothing is allowed to overwrite the recovery they are looking at.
-        if matches!(self.screen, Screen::Result(_)) {
-            return;
-        }
-        if self.frame.is_empty() {
-            self.state = DecodeState::NoFrames;
-            return;
-        }
-        self.state = match crate::clean::clean_luma(
-            &self.frame.luma,
-            self.frame.width as u32,
-            self.frame.height as u32,
-        ) {
+        self.state = match outcome.result {
             Ok(c) => {
                 self.last_symbol = Some((c.dimension, c.px_per_module));
                 let (rescued, total) = (c.blocks_rescued(), c.blocks_total);
                 let payload = c.payload.clone();
-                        // Freeze on any successful decode, not only a rescued one: a logo-branded code that
+                // Freeze on any successful decode, not only a rescued one: a logo-branded code that
                 // reads fine still carries a logo the user wants gone, and the pristine rebuild is
-                // the thing they came for either way.
+                // what they came for either way.
                 self.freeze(c);
                 if rescued > 0 {
-                    DecodeState::Recovered {
-                        payload,
-                        rescued,
-                        total,
-                    }
+                    DecodeState::Recovered { payload, rescued, total }
                 } else {
                     DecodeState::Decoded(payload)
                 }
             }
-            Err(crate::clean::CleanError::Unrecoverable {
-                blocks_total,
-                blocks_decoded,
-            }) => DecodeState::TooDamaged {
-                decoded: blocks_decoded,
-                total: blocks_total,
+            Err(crate::clean::CleanError::Unrecoverable { blocks_total, blocks_decoded }) => {
+                DecodeState::TooDamaged { decoded: blocks_decoded, total: blocks_total }
+            }
+            Err(_) => match outcome.fallback {
+                Some((payload, format)) => DecodeState::Uncleaned { payload, format },
+                None => DecodeState::Searching,
             },
-            Err(_) => self.stock_fallback(),
         };
+        self.pending_frame = true;
+
+        // Roughly once a second, from the render thread where the state is consistent. Gated on a
+        // watermark rather than a modulus: collect() runs per vsync while frames arrive per
+        // capture, so a modulus fires twice whenever the two happen to line up.
+        if self.frames() >= self.last_logged_frame + 30 {
+            self.last_logged_frame = self.frames();
+            #[cfg(target_os = "android")]
+            log::info!(
+                "frame {} ({} ms): {}",
+                self.frames(),
+                self.last_decode_ms,
+                self.status_line()
+            );
+        }
     }
 
     /// Freeze a successful clean into the result screen.
@@ -398,6 +312,7 @@ impl BarcleanApp {
             return;
         };
         let recovered = verdicts.iter().filter(|v| v.recovered()).count();
+        self.feed.set_frozen(true);
         self.screen = Screen::Result(Box::new(ResultView {
             inverted: cleaned.source_inverted,
             payload: cleaned.payload,
@@ -413,6 +328,7 @@ impl BarcleanApp {
 
     /// Return to the camera, discarding the frozen result.
     fn resume_scanning(&mut self) {
+        self.feed.set_frozen(false);
         self.screen = Screen::Scanning;
         self.state = DecodeState::Searching;
         self.pending_frame = true;
@@ -428,37 +344,19 @@ impl BarcleanApp {
         matches!(self.screen, Screen::Result(_))
     }
 
-    /// Stock multi-format decode, tried when the QR cleaner finds nothing.
-    ///
-    /// Two jobs. It makes the app read the three symbologies whose cleaning is not wired yet, and
-    /// it is the diagnostic that separates a detection failure from a cleaning failure — if this
-    /// succeeds where the cleaner did not, the camera and the imaging path are fine and the problem
-    /// is downstream.
-    fn stock_fallback(&self) -> DecodeState {
-        match rxing::helpers::detect_in_luma(
-            self.frame.luma.clone(),
-            self.frame.width as u32,
-            self.frame.height as u32,
-            None,
-        ) {
-            Ok(r) => DecodeState::Uncleaned {
-                payload: r.getText().to_string(),
-                format: format!("{:?}", r.getBarcodeFormat()),
-            },
-            Err(_) => DecodeState::Searching,
-        }
-    }
-
     /// Blit the camera preview, letterboxed to preserve aspect ratio.
     ///
     /// Nearest-neighbour on purpose. This is a diagnostic view of what the decoder is actually
     /// being fed, and a smoothing filter would hide precisely the undersampling that makes symbols
     /// fail — a preview that looks better than the data is worse than useless here.
     fn blit_preview(&self, target: &mut [u32], w: usize, h: usize) {
-        if self.frame.is_empty() || w == 0 || h == 0 {
+        let Some(frame) = self.frame.as_ref() else {
+            return;
+        };
+        if frame.is_empty() || w == 0 || h == 0 {
             return;
         }
-        let (fw, fh) = self.frame.rotated_dims();
+        let (fw, fh) = frame.rotated_dims();
         if fw == 0 || fh == 0 {
             return;
         }
@@ -472,7 +370,7 @@ impl BarcleanApp {
             let sy = y * fh / dh;
             for x in 0..dw {
                 let sx = x * fw / dw;
-                let v = self.frame.sample_upright(sx, sy);
+                let v = frame.sample_upright(sx, sy);
                 let idx = (oy + y) * w + (ox + x);
                 if idx < target.len() {
                     // Under, not assign: the chrome was already painted on top of this.
@@ -496,7 +394,9 @@ impl BarcleanApp {
                 "searching…".into(),
                 Some(format!(
                     "{}x{}  {} ms/frame",
-                    self.frame.width, self.frame.height, self.last_decode_ms
+                    self.frame.as_ref().map_or(0, |f| f.width),
+                    self.frame.as_ref().map_or(0, |f| f.height),
+                    self.last_decode_ms
                 )),
             ),
             DecodeState::Decoded(p) => (
@@ -606,7 +506,12 @@ impl FluorApp for BarcleanApp {
     /// returns `true`. Returning `false` unconditionally — the trait default — leaves a camera app
     /// repainting only on touch, since input is otherwise the only thing that dirties the window.
     fn tick(&mut self, _ctx: &mut Context) -> bool {
-        core::mem::take(&mut self.pending_frame)
+        // The render thread owns app state, so this is where worker results are taken up. Doing it
+        // here rather than in the camera callback is what removed the data race that produced
+        // tearing.
+        let had_frame = self.frame.is_some();
+        self.collect();
+        core::mem::take(&mut self.pending_frame) || (!had_frame && self.frame.is_some())
     }
 
     fn render(&mut self, target: &mut [u32], ctx: &mut Context) {
@@ -663,48 +568,8 @@ impl FluorApp for BarcleanApp {
 mod tests {
     use super::*;
 
-    #[test]
-    fn stride_padding_is_compacted_not_sheared() {
-        // Camera2 pads rows; treating stride as width shears the image progressively downward.
-        // Build a 4x3 frame inside an 8-wide stride and confirm the padding is dropped.
-        let width = 4;
-        let height = 3;
-        let stride = 8;
-        let mut padded = vec![0u8; stride * height];
-        for y in 0..height {
-            for x in 0..width {
-                padded[y * stride + x] = (y * 10 + x) as u8;
-            }
-        }
-
-        let mut app = BarcleanApp::new();
-        app.on_camera_frame(&padded, width, height, stride, 0);
-
-        assert_eq!(app.frame.width, width);
-        assert_eq!(app.frame.height, height);
-        assert_eq!(app.frame.luma.len(), width * height);
-        for y in 0..height {
-            for x in 0..width {
-                assert_eq!(
-                    app.frame.luma[y * width + x],
-                    (y * 10 + x) as u8,
-                    "row {y} column {x} came from the wrong place"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn short_or_empty_frames_are_ignored() {
-        let mut app = BarcleanApp::new();
-
-        app.on_camera_frame(&[], 0, 0, 0, 0);
-        assert_eq!(app.frames(), 0);
-
-        // Buffer shorter than the declared geometry must not panic or half-fill.
-        app.on_camera_frame(&[1, 2, 3], 10, 10, 10, 0);
-        assert_eq!(app.frames(), 0);
-        assert_eq!(*app.state(), DecodeState::NoFrames);
+    fn app() -> BarcleanApp {
+        BarcleanApp::new(Arc::new(CameraFeed::new()))
     }
 
     fn lens(id: &str, focal: f32) -> LensSpec {
@@ -722,7 +587,7 @@ mod tests {
     fn re_enumerating_lenses_does_not_duplicate_buttons() {
         // The shim re-enumerates on every camera open, which happens on surfaceChanged AND on
         // onResume. Without deduplication every lens gained a second button after the first resume.
-        let mut app = BarcleanApp::new();
+        let mut app = app();
         let three = vec![lens("3", 2.23), lens("2", 6.9), lens("4", 18.0)];
 
         app.set_lenses(three.clone(), "2");
@@ -735,52 +600,82 @@ mod tests {
     }
 
     #[test]
-    fn a_frame_without_a_symbol_reports_searching() {
-        let mut app = BarcleanApp::new();
-        app.on_camera_frame(&vec![128u8; 64 * 64], 64, 64, 64, 0);
-        assert_eq!(app.frames(), 1);
-        assert_eq!(*app.state(), DecodeState::Searching);
+    fn starts_with_no_frames_and_no_result() {
+        let app = app();
+        assert_eq!(*app.state(), DecodeState::NoFrames);
+        assert_eq!(app.frames(), 0);
+        assert!(!app.is_frozen());
     }
 
     #[test]
-    fn a_rendered_symbol_decodes_through_the_camera_entry_point() {
-        // End-to-end through the same call the JNI shim makes: render a symbol to a luma buffer and
-        // confirm the payload comes back. Guards the wiring between the camera path and the cleaner,
-        // which no amount of algorithm testing would catch.
+    fn collecting_a_decode_freezes_and_stops_the_worker() {
         use crate::Symbology;
         use crate::corpus::symbol;
 
-        let payload = "barclean camera path";
-        let spec = symbol::generate(Symbology::QrCode, payload, "M").unwrap();
+        let spec = symbol::generate(Symbology::QrCode, "freeze me", "M").unwrap();
         let img = symbol::render(&spec, 6, 6);
         let (w, h) = (img.width() as usize, img.height() as usize);
         let luma: Vec<u8> = img.pixels().map(|p| p.0[0]).collect();
 
-        let mut app = BarcleanApp::new();
-        app.on_camera_frame(&luma, w, h, w, 0);
+        let feed = Arc::new(CameraFeed::new());
+        let worker = crate::feed::spawn_worker(Arc::clone(&feed));
+        let mut app = BarcleanApp::new(Arc::clone(&feed));
+        feed.submit(&luma, w, h, w, 0);
 
-        assert_eq!(
-            app.state().payload(),
-            Some(payload),
-            "camera entry point did not decode a clean rendered symbol, state was {:?}",
-            app.state()
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !app.is_frozen() {
+            app.collect();
+            assert!(std::time::Instant::now() < deadline, "never froze on a clean symbol");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        assert_eq!(app.state().payload(), Some("freeze me"));
+        assert!(
+            feed.is_frozen(),
+            "the feed must stop decoding so a later frame cannot overwrite the result"
         );
+
+        // Returning to the camera resumes decoding.
+        app.resume_scanning();
+        assert!(!app.is_frozen());
+        assert!(!feed.is_frozen());
+
+        feed.stop();
+        worker.join().unwrap();
     }
 
     #[test]
-    fn preview_blit_stays_in_bounds_for_any_aspect() {
-        // Letterboxing must never write outside the target, whichever way the aspect mismatch runs.
-        for (fw, fh) in [(64usize, 16usize), (16, 64), (33, 33)] {
-            let mut app = BarcleanApp::new();
-            app.on_camera_frame(&vec![200u8; fw * fh], fw, fh, fw, 0);
-
-            let (w, h) = (40usize, 30usize);
-            let mut target = vec![0u32; w * h];
-            app.blit_preview(&mut target, w, h);
-            assert!(
-                target.iter().any(|&p| p != 0),
-                "{fw}x{fh} frame produced no output at all"
-            );
+    fn status_line_distinguishes_every_state() {
+        let mut app = app();
+        let mut seen: Vec<String> = Vec::new();
+        for state in [
+            DecodeState::NoFrames,
+            DecodeState::Searching,
+            DecodeState::Decoded("x".into()),
+            DecodeState::Recovered { payload: "x".into(), rescued: 2, total: 8 },
+            DecodeState::TooDamaged { decoded: 1, total: 8 },
+            DecodeState::Uncleaned { payload: "x".into(), format: "AZTEC".into() },
+        ] {
+            app.state = state;
+            let line = app.status_line();
+            assert!(!line.is_empty());
+            assert!(!seen.contains(&line), "two states share the status line {line:?}");
+            seen.push(line);
         }
+    }
+
+    #[test]
+    fn payload_is_exposed_for_every_state_that_has_one() {
+        assert_eq!(DecodeState::Decoded("a".into()).payload(), Some("a"));
+        assert_eq!(
+            DecodeState::Recovered { payload: "b".into(), rescued: 1, total: 2 }.payload(),
+            Some("b")
+        );
+        assert_eq!(
+            DecodeState::Uncleaned { payload: "c".into(), format: "AZTEC".into() }.payload(),
+            Some("c")
+        );
+        assert_eq!(DecodeState::Searching.payload(), None);
+        assert_eq!(DecodeState::TooDamaged { decoded: 0, total: 1 }.payload(), None);
     }
 }

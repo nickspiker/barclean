@@ -82,6 +82,7 @@ pub mod ui;
 pub mod jni;
 pub mod clean;
 pub mod corpus;
+pub mod feed;
 pub mod render;
 pub mod sample;
 

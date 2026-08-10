@@ -9,7 +9,9 @@
 //! including all drawing and all decoding, is Rust.
 
 use crate::app::BarcleanApp;
+use crate::feed::{CameraFeed, spawn_worker};
 use fluor::host::android::AndroidShell;
+use std::sync::Arc;
 use jni::objects::{JByteArray, JClass, JObject, JString};
 use jni::sys::{jboolean, jfloat, jint, jlong};
 use jni::JNIEnv;
@@ -19,6 +21,11 @@ use ndk::native_window::NativeWindow;
 /// Everything the Activity holds across its lifetime, behind one opaque `jlong`.
 pub struct BarcleanContext {
     pub shell: AndroidShell<BarcleanApp>,
+    /// Shared with the decode worker and written by the camera thread. The camera callback touches
+    /// only this — never the shell — which is what keeps the render thread's view of a frame stable
+    /// for the whole of a draw.
+    pub feed: Arc<CameraFeed>,
+    pub worker: Option<std::thread::JoinHandle<()>>,
 }
 
 /// Recover the context from the pointer Kotlin is holding.
@@ -50,8 +57,16 @@ pub extern "C" fn Java_com_barclean_BarcleanActivity_nativeInit(
     }));
 
     info!("nativeInit {width}x{height}");
+    let feed = Arc::new(CameraFeed::new());
+    let worker = spawn_worker(Arc::clone(&feed));
     let context = Box::new(BarcleanContext {
-        shell: AndroidShell::new(BarcleanApp::new(), width.max(1) as u32, height.max(1) as u32),
+        shell: AndroidShell::new(
+            BarcleanApp::new(Arc::clone(&feed)),
+            width.max(1) as u32,
+            height.max(1) as u32,
+        ),
+        feed,
+        worker: Some(worker),
     });
     Box::into_raw(context) as jlong
 }
@@ -137,25 +152,15 @@ pub extern "C" fn Java_com_barclean_BarcleanActivity_nativeOnCameraFrame(
     };
     // JNI hands back i8; the plane is unsigned.
     let luma: Vec<u8> = bytes.into_iter().map(|b| b as u8).collect();
-    let app = ctx.shell.app();
-    app.on_camera_frame(
+    // Straight into the feed. This function must NOT touch `ctx.shell` — the render thread owns
+    // the app, and reaching into it from here is the data race that showed up as tearing.
+    ctx.feed.submit(
         &luma,
         width.max(0) as usize,
         height.max(0) as usize,
         row_stride.max(0) as usize,
         rotation.max(0) as u32,
     );
-
-    // Every 30th frame, roughly once a second. Enough to see what the decoder is concluding and
-    // how long it is taking without flooding logcat at frame rate.
-    if app.frames() % 30 == 0 {
-        info!(
-            "frame {} ({} ms): {}",
-            app.frames(),
-            app.last_decode_ms(),
-            app.status_line()
-        );
-    }
 }
 
 /// Report one physical lens the shim enumerated.
@@ -280,5 +285,12 @@ pub extern "C" fn Java_com_barclean_BarcleanActivity_nativeDestroy(
         return;
     }
     info!("nativeDestroy");
-    drop(unsafe { Box::from_raw(ptr as *mut BarcleanContext) });
+    let mut ctx = unsafe { Box::from_raw(ptr as *mut BarcleanContext) };
+    // Join the worker before dropping anything it borrows. It parks on a condvar, so it has to be
+    // woken explicitly or this waits forever.
+    ctx.feed.stop();
+    if let Some(worker) = ctx.worker.take() {
+        let _ = worker.join();
+    }
+    drop(ctx);
 }
