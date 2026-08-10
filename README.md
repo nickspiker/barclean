@@ -83,21 +83,25 @@ won't look like the code you photographed.
 
 So the tests compare **module by module** against the original, not payload against payload.
 
-| | detect | recover | restore | bootstrap |
-|---|---|---|---|---|
-| **QR** | ✓ | ✓ | bit-exact | ✓ |
-| **Aztec** | ✓ | ✓ | bit-exact | — single RS block |
-| **DataMatrix** | ✓ | ✓ | bit-exact | ✓ above 24×24 |
-| **PDF417** | ✓ | ✓ | re-encoded + verified | — single RS block |
+**All four restore bit-exactly**, by three different routes — because the formats are built
+differently:
+
+| | detect | recover | restore | how | bootstrap |
+|---|---|---|---|---|---|
+| **QR** | ✓ | ✓ | bit-exact | rebuilt from corrected codewords | ✓ |
+| **Aztec** | ✓ | ✓ | bit-exact | corrected bits written back into their own modules | — single RS block |
+| **DataMatrix** | ✓ | ✓ | bit-exact | corrected codewords written back into their own modules | ✓ above 24×24 |
+| **PDF417** | ✓ | ✓ | bit-exact | redrawn from corrected codewords | — single RS block |
+
+QR, Aztec and DataMatrix are sampled onto a module grid, so their decoders can be instrumented to
+record *which module produced which codeword* — correction then writes back exactly where it read.
+PDF417 has no such grid: it decodes by **scanning rows**. But its structure is fully determined by
+the codewords plus the row and column counts, so it is redrawn from the corrected stream instead —
+never touching the high-level encoder, which is the part that would invent a different symbol.
 
 Aztec and PDF417 carry one Reed–Solomon block, so there are no survivors to bootstrap from — they
 decode or they don't. They still get everything that follows a successful decode, which covers the
 damage people actually bring: folds, smudges, scuffs, bad printing.
-
-PDF417 is the one remaining gap: its corrected codewords sit inside a private call chain in the
-scanning decoder, so it is re-encoded from the payload for now — and every re-encode is verified by
-decoding it again and comparing payloads before it can be saved. A restoration that doesn't scan is
-useless; one that scans to *something else* is dangerous.
 
 ## The app
 
@@ -109,8 +113,10 @@ Point it at a code. It freezes on a successful scan and shows what it did:
 - **red** — dark module, **recovered**
 
 A logo's footprint shows up as a solid yellow-and-red patch, so "this was reconstructed" is something
-you can see rather than take on faith. Where no comparison is possible the symbol is drawn plainly in
-black and white, and says so — it never colours an uncompared rebuild as if it matched.
+you can see rather than take on faith. PDF417's comparison is at codeword granularity — the granularity its correction
+actually works at — rather than per module. Where no comparison is possible at all the symbol is
+drawn plainly in black and white and says so; it never colours an uncompared rebuild as if it
+matched.
 
 **Save** writes a black-and-white PNG to `Pictures/barclean` as `2026-08-10 14:33:48.png`, with the
 quiet zone the symbology needs. **Cancel** returns to the camera.
@@ -150,8 +156,9 @@ APK* — see the comment in `android/app/build.gradle`.
 
 - [rxing](https://github.com/rxing-core/rxing) — the Rust ZXing port, forked at
   [nickspiker/rxing](https://github.com/nickspiker/rxing) (branch `barclean`) to add erasure-aware
-  Reed–Solomon, per-block partial decoding, and codeword-to-module provenance for QR, Aztec and
-  DataMatrix. All additive; the RS work is cleanly upstreamable.
+  Reed–Solomon, per-block partial decoding, codeword-to-module provenance for QR, Aztec and
+  DataMatrix, and codeword-level rendering for PDF417. All additive; the RS work is cleanly
+  upstreamable.
 - [fluor](https://github.com/nickspiker/fluor) — CPU softbuffer GUI compositor. One `FluorApp` runs
   on both the desktop shell and the Android shell.
 

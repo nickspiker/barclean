@@ -314,10 +314,14 @@ impl BarcleanApp {
         // A comparison only exists where the sampled matrix aligns with the rebuild, which is the
         // exact path. For a re-encode the symbol may not even be the same size, so the grid shows
         // the restoration plainly rather than inventing a diff against a different symbol.
-        let verdicts = cleaned
-            .sampled
-            .as_ref()
-            .and_then(|s| crate::render::compare(&cleaned.rebuilt, s));
+        // A symbology either hands over a ready comparison (PDF417, at codeword granularity) or a
+        // sampled matrix to diff against the rebuild.
+        let verdicts = cleaned.verdicts.clone().or_else(|| {
+            cleaned
+                .sampled
+                .as_ref()
+                .and_then(|s| crate::render::compare(&cleaned.rebuilt, s))
+        });
         let recovered = verdicts
             .as_ref()
             .map(|v| v.iter().filter(|v| v.recovered()).count())

@@ -15,9 +15,11 @@
 //! on symbols large enough to interleave their blocks. Smaller ones carry a single block and behave
 //! like Aztec.
 //!
-//! **PDF417** is still re-encoded from the recovered payload and verified. Giving it what the others
-//! have means instrumenting its row structure, which is real work independent of the recovery
-//! itself.
+//! **PDF417** is exact by a third route. It has no module grid to write back into — it decodes by
+//! *scanning rows* — but its structure is fully determined by the codewords plus the row and column
+//! counts, so it is redrawn from the corrected stream without ever touching the high-level encoder
+//! that would have invented a different symbol. Its comparison is at codeword granularity, which is
+//! the granularity correction worked at.
 //!
 //! What all four *do* get is the thing this is for: photograph a damaged code — folded, smudged,
 //! scuffed, printed badly — and get back a clean one. Ordinary Reed-Solomon already recovers the
@@ -62,6 +64,9 @@ pub struct CleanedAny {
     /// exact restoration — a re-encode may not even be the same size, and a comparison against a
     /// differently-shaped symbol would be noise dressed up as evidence.
     pub sampled: Option<Vec<bool>>,
+    /// Ready-made comparison, for symbologies that produce one directly rather than through a
+    /// sampled matrix.
+    pub verdicts: Option<Vec<crate::render::ModuleVerdict>>,
     /// Blocks the bootstrap loop rescued, for the formats that have more than one.
     pub blocks_rescued: usize,
     pub blocks_total: usize,
@@ -108,6 +113,7 @@ pub fn clean(luma: &[u8], width: u32, height: u32) -> Result<CleanedAny, CleanEr
             payload: qr.payload,
             fidelity: Fidelity::Exact,
             sampled: Some(qr.sampled),
+            verdicts: None,
             rebuilt,
             blocks_rescued: qr.blocks_total - qr.blocks_decoded_initially,
             blocks_total: qr.blocks_total,
@@ -131,6 +137,7 @@ pub fn clean(luma: &[u8], width: u32, height: u32) -> Result<CleanedAny, CleanEr
                 payload: az.payload,
                 fidelity: Fidelity::Exact,
                 sampled: Some(az.sampled),
+                verdicts: None,
                 rebuilt: az.rebuilt,
                 // One block: it decoded, so nothing was "rescued" in the bootstrap sense. The
                 // repaired-module count in the comparison grid is the honest measure of work done.
@@ -158,6 +165,7 @@ pub fn clean(luma: &[u8], width: u32, height: u32) -> Result<CleanedAny, CleanEr
                 payload: dm.payload,
                 fidelity: Fidelity::Exact,
                 sampled: Some(dm.sampled),
+                verdicts: None,
                 rebuilt: dm.rebuilt,
                 blocks_rescued: rescued,
                 blocks_total: dm.blocks_total,
@@ -167,8 +175,38 @@ pub fn clean(luma: &[u8], width: u32, height: u32) -> Result<CleanedAny, CleanEr
         }
     }
 
-    // Everything else, upright then inverted — light-on-dark codes are common and the binarizer
-    // marks the background as the dark modules, so they are simply invisible otherwise.
+    // PDF417: exact too, by redrawing from the corrected codewords. It has no module grid to write
+    // back into — it decodes by scanning rows — but its structure is fully determined, so the
+    // redraw is bit-identical without ever touching the high-level encoder.
+    for (candidate, inverted) in [(luma.to_vec(), false)]
+        .into_iter()
+        .chain(std::iter::once((
+            luma.iter().map(|v| 255 - v).collect::<Vec<u8>>(),
+            true,
+        )))
+    {
+        if let Ok(pd) = crate::clean::pdf417::clean_luma(&candidate, width, height) {
+            return Ok(CleanedAny {
+                symbology: Symbology::Pdf417,
+                payload: pd.payload,
+                fidelity: Fidelity::Exact,
+                // Verdicts are supplied directly rather than derived from a sampled matrix: the
+                // comparison is at codeword granularity, which is the granularity correction
+                // actually worked at.
+                verdicts: Some(pd.verdicts),
+                sampled: None,
+                rebuilt: pd.rebuilt,
+                blocks_rescued: 0,
+                blocks_total: 1,
+                source_inverted: inverted,
+                px_per_module: 0.0,
+            });
+        }
+    }
+
+    // Anything left: decode conventionally and re-encode. Nothing reaches here today — every
+    // supported symbology has an exact path — but a new format would land softly rather than
+    // failing outright.
     let (result, inverted) = match rxing::helpers::detect_in_luma(luma.to_vec(), width, height, None)
     {
         Ok(r) => (r, false),
@@ -192,6 +230,7 @@ pub fn clean(luma: &[u8], width: u32, height: u32) -> Result<CleanedAny, CleanEr
         fidelity: Fidelity::Reencoded,
         rebuilt,
         sampled: None,
+        verdicts: None,
         blocks_rescued: 0,
         blocks_total: 1,
         source_inverted: inverted,
@@ -277,10 +316,8 @@ mod tests {
             assert_eq!(cleaned.payload, PAYLOAD, "{}: payload mismatch", symbology.name());
             assert!(!cleaned.source_inverted);
 
-            let expected = match symbology {
-                Symbology::Pdf417 => Fidelity::Reencoded,
-                _ => Fidelity::Exact,
-            };
+            assert_eq!(cleaned.fidelity, Fidelity::Exact, "{}", symbology.name());
+            let expected = Fidelity::Exact;
             assert_eq!(cleaned.fidelity, expected, "{}", symbology.name());
         }
     }
@@ -320,14 +357,18 @@ mod tests {
     }
 
     #[test]
-    fn only_exact_restorations_carry_a_comparable_sampled_matrix() {
+    fn every_symbology_carries_a_comparison() {
         // A re-encode may not even be the same size as the original, so offering a module-by-module
         // comparison for it would be noise presented as evidence.
         for symbology in Symbology::ALL {
             let (luma, w, h) = render_luma(symbology, PAYLOAD, 8);
             let cleaned = clean(&luma, w, h).unwrap();
             match symbology {
-                Symbology::Pdf417 => assert!(cleaned.sampled.is_none(), "{}", symbology.name()),
+                // PDF417 supplies verdicts directly instead of a sampled matrix.
+                Symbology::Pdf417 => {
+                    assert!(cleaned.sampled.is_none());
+                    assert!(cleaned.verdicts.is_some(), "PDF417 must carry its comparison");
+                }
                 _ => {
                     let sampled = cleaned
                         .sampled
